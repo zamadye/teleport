@@ -20,6 +20,7 @@ package common
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -54,6 +55,7 @@ import (
 	"github.com/gravitational/teleport/lib/service"
 	"github.com/gravitational/teleport/lib/service/servicecfg"
 	"github.com/gravitational/teleport/lib/srv"
+	"github.com/gravitational/teleport/lib/srv/server/installer"
 	"github.com/gravitational/teleport/lib/sshutils/scp"
 	"github.com/gravitational/teleport/lib/tpm"
 	"github.com/gravitational/teleport/lib/utils"
@@ -884,6 +886,11 @@ Examples:
 		err = onBackendEdit(ctx, conf.Auth.StorageConfig, ccf.BackendKey)
 	}
 	if err != nil {
+		// The agent was installed but failed to join the cluster.
+		if errors.Is(err, installer.ErrJoinFailure) {
+			fmt.Fprintln(os.Stderr, utils.UserMessageFromError(err))
+			os.Exit(installer.JoinFailureExitCode)
+		}
 		utils.FatalError(err)
 	}
 
