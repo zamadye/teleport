@@ -28,6 +28,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/buildkite/bintest/v3"
 	"github.com/gravitational/trace"
@@ -144,6 +145,12 @@ func TestAutoDiscoverNode_CheckAndSetDefaults(t *testing.T) {
 			conf := tt.initial
 			err := conf.checkAndSetDefaults()
 			require.NoError(t, err)
+			require.NotNil(t, conf.clock)
+			require.Equal(t, 30*time.Second, conf.joinCheckDelay)
+			// clock is an interface with internal state — compare
+			// everything else by zeroing it out in both structs.
+			conf.clock = nil
+			conf.joinCheckDelay = 0
 			require.Equal(t, tt.expected, conf)
 		})
 	}
@@ -260,6 +267,7 @@ func TestAutoDiscoverNode(t *testing.T) {
 						imdsProviders:        mockIMDSProviders,
 						binariesLocation:     binariesLocation,
 						aptPublicKeyEndpoint: mockRepoKeys.URL,
+						joinCheckDelay:       time.Millisecond,
 					}
 
 					teleportInstaller, err := NewAutoDiscoverNodeInstaller(installerConfig)
@@ -360,6 +368,7 @@ func TestAutoDiscoverNode(t *testing.T) {
 			binariesLocation:       binariesLocation,
 			aptPublicKeyEndpoint:   mockRepoKeys.URL,
 			autoUpgradesChannelURL: proxyServer.URL,
+			joinCheckDelay:        time.Millisecond,
 		}
 
 		teleportInstaller, err := NewAutoDiscoverNodeInstaller(installerConfig)
@@ -430,6 +439,7 @@ func TestAutoDiscoverNode(t *testing.T) {
 			binariesLocation:       binariesLocation,
 			aptPublicKeyEndpoint:   mockRepoKeys.URL,
 			autoUpgradesChannelURL: proxyServer.URL,
+			joinCheckDelay:        time.Millisecond,
 		}
 
 		teleportInstaller, err := NewAutoDiscoverNodeInstaller(installerConfig)
@@ -515,6 +525,7 @@ func TestAutoDiscoverNode(t *testing.T) {
 			imdsProviders:        mockIMDSProviders,
 			binariesLocation:     binariesLocation,
 			aptPublicKeyEndpoint: mockRepoKeys.URL,
+			joinCheckDelay:       time.Millisecond,
 		}
 
 		teleportInstaller, err := NewAutoDiscoverNodeInstaller(installerConfig)
@@ -586,6 +597,7 @@ func TestAutoDiscoverNode(t *testing.T) {
 			},
 			binariesLocation:     binariesLocation,
 			aptPublicKeyEndpoint: mockRepoKeys.URL,
+			joinCheckDelay:       time.Millisecond,
 		}
 
 		teleportInstaller, err := NewAutoDiscoverNodeInstaller(installerConfig)
@@ -620,6 +632,7 @@ func TestAutoDiscoverNode(t *testing.T) {
 			imdsProviders:        mockIMDSProviders,
 			binariesLocation:     binariesLocation,
 			aptPublicKeyEndpoint: mockRepoKeys.URL,
+			joinCheckDelay:       time.Millisecond,
 		}
 
 		teleportInstaller, err := NewAutoDiscoverNodeInstaller(installerConfig)
@@ -687,6 +700,7 @@ func TestAutoDiscoverNode(t *testing.T) {
 			imdsProviders:        mockIMDSProviders,
 			binariesLocation:     binariesLocation,
 			aptPublicKeyEndpoint: mockRepoKeys.URL,
+			joinCheckDelay:       time.Millisecond,
 		}
 
 		teleportInstaller, err := NewAutoDiscoverNodeInstaller(installerConfig)
@@ -750,6 +764,7 @@ func TestAutoDiscoverNode(t *testing.T) {
 			imdsProviders:        mockIMDSProviders,
 			binariesLocation:     binariesLocation,
 			aptPublicKeyEndpoint: mockRepoKeys.URL,
+			joinCheckDelay:       time.Millisecond,
 		}
 
 		teleportInstaller, err := NewAutoDiscoverNodeInstaller(installerConfig)
@@ -813,6 +828,7 @@ func TestAutoDiscoverNode(t *testing.T) {
 			imdsProviders:        mockIMDSProviders,
 			binariesLocation:     binariesLocation,
 			aptPublicKeyEndpoint: mockRepoKeys.URL,
+			joinCheckDelay:       time.Millisecond,
 		}
 
 		teleportInstaller, err := NewAutoDiscoverNodeInstaller(installerConfig)

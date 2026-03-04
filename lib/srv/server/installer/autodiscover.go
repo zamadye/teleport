@@ -22,6 +22,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -32,12 +33,15 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/google/safetext/shsprintf"
 	"github.com/gravitational/trace"
+	"github.com/jonboulle/clockwork"
 
 	"github.com/gravitational/teleport/api"
 	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/teleport/lib/client/debug"
 	"github.com/gravitational/teleport/lib/automaticupgrades/constants"
 	"github.com/gravitational/teleport/lib/automaticupgrades/version"
 	"github.com/gravitational/teleport/lib/cloud"
@@ -52,6 +56,18 @@ import (
 	"github.com/gravitational/teleport/lib/utils"
 	"github.com/gravitational/teleport/lib/utils/packagemanager"
 )
+
+const (
+	// defaultJoinCheckDelay is the time to wait after starting the teleport
+	// service before checking if the agent successfully joined the cluster.
+	defaultJoinCheckDelay = 30 * time.Second
+)
+
+// ErrJoinFailure is returned when the Teleport agent is installed but fails to join the cluster.
+var ErrJoinFailure = errors.New("join failure")
+
+// JoinFailureExitCode is the exit code for a join failure.
+const JoinFailureExitCode = 150
 
 const (
 	discoverNotice = "" +
@@ -113,6 +129,13 @@ type AutoDiscoverNodeInstallerConfig struct {
 	// imdsProviders contains the Cloud Instance Metadata providers.
 	// Used for testing.
 	imdsProviders []func(ctx context.Context) (imds.Client, error)
+
+	// joinCheckDelay is how long to wait after starting the Teleport service before
+	// querying the readyz endpoint. Defaults to defaultJoinCheckDelay (30s).
+	joinCheckDelay time.Duration
+
+	// clock is used for time-dependent operations. Defaults to a real clock.
+	clock clockwork.Clock
 }
 
 func (c *AutoDiscoverNodeInstallerConfig) checkAndSetDefaults() error {
@@ -160,6 +183,13 @@ func (c *AutoDiscoverNodeInstallerConfig) checkAndSetDefaults() error {
 	}
 
 	c.binariesLocation.CheckAndSetDefaults()
+
+	if c.joinCheckDelay == 0 {
+		c.joinCheckDelay = defaultJoinCheckDelay
+	}
+	if c.clock == nil {
+		c.clock = clockwork.NewRealClock()
+	}
 
 	if len(c.imdsProviders) == 0 {
 		c.imdsProviders = []func(ctx context.Context) (imds.Client, error){
@@ -238,11 +268,27 @@ func (ani *AutoDiscoverNodeInstaller) Install(ctx context.Context) error {
 		)
 	}
 
+	// Install and configure under the file lock. The health check runs
+	// after the lock is released because it only reads the debug socket
+	// and holding the lock during the 30s delay would block concurrent
+	// invocations from discovery re-polls.
+	serviceAlreadyRunning, err := ani.installAndConfigure(ctx)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+
+	return trace.Wrap(ani.checkJoinHealth(ctx, serviceAlreadyRunning))
+}
+
+// installAndConfigure acquires the install lock and performs the install and
+// configuration steps. It reports whether the service was already running
+// so the caller can decide whether to skip the health-check delay.
+func (ani *AutoDiscoverNodeInstaller) installAndConfigure(ctx context.Context) (serviceAlreadyRunning bool, err error) {
 	// Ensure only one installer is running by locking the same file as the script installers.
 	lockFile := ani.buildAbsoluteFilePath(exclusiveInstallFileLock)
 	unlockFn, err := utils.FSTryWriteLock(lockFile)
 	if err != nil {
-		return trace.BadParameter("Could not get lock %s. Either remove it or wait for the other installer to finish.", lockFile)
+		return false, trace.BadParameter("Could not get lock %s. Either remove it or wait for the other installer to finish.", lockFile)
 	}
 	defer func() {
 		if err := unlockFn(); err != nil {
@@ -252,7 +298,7 @@ func (ani *AutoDiscoverNodeInstaller) Install(ctx context.Context) error {
 
 	imdsClient, err := ani.getIMDSClient(ctx)
 	if err != nil {
-		return trace.Wrap(err)
+		return false, trace.Wrap(err)
 	}
 	ani.Logger.InfoContext(ctx, "Detected cloud provider", "cloud", imdsClient.GetType())
 
@@ -264,12 +310,12 @@ func (ani *AutoDiscoverNodeInstaller) Install(ctx context.Context) error {
 		// then this is an error because teleport-update should have installed it.
 		// This prevents the installer from installing teleport in a different version and/or location than the one managed by teleport-update.
 		if ani.InstallationManagedByTeleportUpdateWithSuffix != "" {
-			return trace.BadParameter("teleport binary not found, ensure teleport-update installed it correctly: %v", err)
+			return false, trace.BadParameter("teleport binary not found, ensure teleport-update installed it correctly: %v", err)
 		}
 
 		ani.Logger.InfoContext(ctx, "Installing teleport")
 		if err := ani.installTeleportFromRepo(ctx); err != nil {
-			return trace.Wrap(err)
+			return false, trace.Wrap(err)
 		}
 	}
 
@@ -281,10 +327,10 @@ func (ani *AutoDiscoverNodeInstaller) Install(ctx context.Context) error {
 			)
 			// Restarting teleport is not required because the target teleport.yaml
 			// is up to date with the existing one.
-			return nil
+			return true, nil
 		}
 
-		return trace.Wrap(err)
+		return false, trace.Wrap(err)
 	}
 	ani.Logger.InfoContext(ctx, "Configuration written",
 		"configuration_file", ani.buildTeleportConfigurationPath(),
@@ -294,9 +340,67 @@ func (ani *AutoDiscoverNodeInstaller) Install(ctx context.Context) error {
 		"systemd_service", ani.buildTeleportSystemdUnitName(),
 	)
 	if err := ani.enableAndRestartTeleportService(ctx); err != nil {
-		return trace.Wrap(err)
+		return false, trace.Wrap(err)
 	}
 
+	return false, nil
+}
+
+// limitStatusLen truncates s to at most maxRunes runes, appending
+// "... (truncated)" if the string was shortened.
+func limitStatusLen(s string, maxRunes int) string {
+	const suffix = "... (truncated)"
+	limit := max(maxRunes-len(suffix), 0) // suffix is ASCII-only, len == rune count
+
+	i := 0
+	for pos := range s {
+		if i >= limit {
+			return s[:pos] + suffix
+		}
+		i++
+	}
+	return s
+}
+
+// checkJoinHealth queries the Teleport debug socket's readyz endpoint to
+// determine whether the agent has joined the cluster.
+func (a *AutoDiscoverNodeInstaller) checkJoinHealth(ctx context.Context, serviceAlreadyRunning bool) error {
+	// If the service was just started, give it time to connect before checking.
+	if !serviceAlreadyRunning && a.joinCheckDelay > 0 {
+		a.Logger.InfoContext(ctx, "Waiting before checking join health", "delay", a.joinCheckDelay)
+		timer := a.clock.NewTimer(a.joinCheckDelay)
+		defer timer.Stop()
+		select {
+		case <-timer.Chan():
+		case <-ctx.Done():
+			return trace.Wrap(ctx.Err())
+		}
+	}
+
+	clt := debug.NewClient(a.buildTeleportDataDirPath())
+
+	readiness, err := clt.GetReadiness(ctx)
+	if err != nil {
+		// The debug socket may not exist if the process hasn't started yet
+		// or if the installed version predates the debug endpoint. Returning
+		// nil means the join status is unknown — a false negative. This is
+		// a deliberate tradeoff: failing open avoids blocking rollouts when
+		// the health check is unavailable, at the cost of missing some join
+		// failures.
+		a.Logger.WarnContext(ctx, "Debug socket not available, skipping join health check",
+			"socket", clt.SocketPath(), "error", err)
+		return nil
+	}
+
+	if !readiness.Ready {
+		const maxStatusLen = 512
+		status := limitStatusLen(readiness.Status, maxStatusLen)
+
+		a.Logger.WarnContext(ctx, "Teleport agent failed to join the cluster", "status", status)
+		return trace.Wrap(ErrJoinFailure, "Teleport agent failed to join the cluster: %s", status)
+	}
+
+	a.Logger.InfoContext(ctx, "Teleport agent is ready and has joined the cluster")
 	return nil
 }
 
