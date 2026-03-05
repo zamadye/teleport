@@ -40,7 +40,6 @@ import (
 	"github.com/gravitational/teleport/api/types/usertasks"
 	awslib "github.com/gravitational/teleport/lib/cloud/aws"
 	libevents "github.com/gravitational/teleport/lib/events"
-	"github.com/gravitational/teleport/lib/srv/server/installer"
 	"github.com/gravitational/teleport/lib/srv/server/installstatus"
 )
 
@@ -494,7 +493,7 @@ func (si *SSMInstaller) checkCommand(ctx context.Context, req SSMRunRequest, com
 					SSMRunEvent:         invocationResultEvent,
 					IntegrationName:     req.IntegrationName,
 					DiscoveryConfigName: req.DiscoveryConfigName,
-					IssueType:           issueTypeFromExitCode(invocationResultEvent.ExitCode),
+					IssueType:           installstatus.ExitCode(invocationResultEvent.ExitCode).IssueType(),
 					SSMDocumentName:     req.DocumentName,
 					InstallerScript:     req.InstallerScriptName(),
 					InstanceName:        instanceMetadata.InstanceName,
@@ -511,7 +510,7 @@ func (si *SSMInstaller) checkCommand(ctx context.Context, req SSMRunRequest, com
 				SSMRunEvent:         stepResultEvent,
 				IntegrationName:     req.IntegrationName,
 				DiscoveryConfigName: req.DiscoveryConfigName,
-				IssueType:           issueTypeFromExitCode(stepResultEvent.ExitCode),
+				IssueType:           installstatus.ExitCode(stepResultEvent.ExitCode).IssueType(),
 				SSMDocumentName:     req.DocumentName,
 				InstallerScript:     req.InstallerScriptName(),
 				InstanceName:        instanceMetadata.InstanceName,
@@ -611,12 +610,4 @@ func (si *SSMInstaller) getCommandStepStatusEvent(ctx context.Context, step stri
 		PlatformType:    instanceMetadata.PlatformType,
 		PlatformVersion: instanceMetadata.PlatformVersion,
 	}, nil
-}
-
-// issueTypeFromExitCode maps an SSM command exit code to a user task issue type.
-func issueTypeFromExitCode(exitCode int64) string {
-	if exitCode == installer.JoinFailureExitCode {
-		return usertasks.AutoDiscoverEC2IssueJoinFailure
-	}
-	return usertasks.AutoDiscoverEC2IssueSSMScriptFailure
 }

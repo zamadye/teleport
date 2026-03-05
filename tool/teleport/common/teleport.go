@@ -56,6 +56,7 @@ import (
 	"github.com/gravitational/teleport/lib/service/servicecfg"
 	"github.com/gravitational/teleport/lib/srv"
 	"github.com/gravitational/teleport/lib/srv/server/installer"
+	"github.com/gravitational/teleport/lib/srv/server/installstatus"
 	"github.com/gravitational/teleport/lib/sshutils/scp"
 	"github.com/gravitational/teleport/lib/tpm"
 	"github.com/gravitational/teleport/lib/utils"
@@ -888,8 +889,17 @@ Examples:
 	if err != nil {
 		// The agent was installed but failed to join the cluster.
 		if errors.Is(err, installer.ErrJoinFailure) {
-			fmt.Fprintln(os.Stderr, utils.UserMessageFromError(err))
-			os.Exit(installer.JoinFailureExitCode)
+			// Print only the annotation message, not the sentinel "join failure" text that trace.UserMessage
+			// appends from the wrapped error chain. Route through UserMessageFromError on a plain error so the
+			// output gets the same colored "ERROR: " prefix as every other error path.
+			var traceErr *trace.TraceErr
+			if errors.As(err, &traceErr) && len(traceErr.Messages) > 0 {
+				msg := traceErr.Messages[0]
+				fmt.Fprintln(os.Stderr, utils.UserMessageFromError(errors.New(msg)))
+			} else {
+				fmt.Fprintln(os.Stderr, utils.UserMessageFromError(err))
+			}
+			os.Exit(int(installstatus.JoinFailure))
 		}
 		utils.FatalError(err)
 	}
