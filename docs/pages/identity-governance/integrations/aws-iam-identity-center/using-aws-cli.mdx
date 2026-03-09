@@ -38,45 +38,45 @@ Before you begin, you will need:
 
 The `tsh aws-profile` command automatically generates native AWS SSO profiles in `~/.aws/config` from your AWS Identity Center integration data.
 
-1.  Run the following command to generate the profiles:
+1. Run the following command to generate the profiles:
 
-    ```shell
-    $ tsh aws-profile
-    AWS configuration updated at: /Users/alice/.aws/config
-    
-    Profile                    Account Account ID   Role   SSO Session
-    -------------------------- ------- ------------ ------ ----------------
-    teleport-awsic-dev-admin   dev     123456789012 Admin  teleport-d-12345
-    teleport-awsic-prod-reader prod    098765432109 Reader teleport-d-12345
-    ```
+   ```shell
+   $ tsh aws-profile
+   AWS configuration updated at: /Users/alice/.aws/config
 
-2.  Select a profile and export it to the `AWS_PROFILE` environment variable. For example:
+   Profile                    Account Account ID   Role   SSO Session
+   -------------------------- ------- ------------ ------ ----------------
+   teleport-awsic-dev-admin   dev     123456789012 Admin  teleport-d-12345
+   teleport-awsic-prod-reader prod    098765432109 Reader teleport-d-12345
+   ```
 
-    ```shell
-    $ export AWS_PROFILE=teleport-awsic-prod-reader
-    ```
+2. Select a profile and export it to the `AWS_PROFILE` environment variable. For example:
 
-3.  Authenticate with AWS SSO:
+   ```shell
+   $ export AWS_PROFILE=teleport-awsic-prod-reader
+   ```
 
-    ```shell
-    $ aws sso login
-    ```
+3. Authenticate with AWS SSO:
 
-    This will open a browser window to complete the authentication process via Teleport.
+   ```shell
+   $ aws sso login
+   ```
 
-4.  Verify the configuration:
+   This will open a browser window to complete the authentication process via Teleport.
 
-    ```shell
-    $ aws sts get-caller-identity
-    ```
+4. Verify the configuration:
 
-5.  Switch to another profile:
+   ```shell
+   $ aws sts get-caller-identity
+   ```
 
-    You can quickly switch to another profile at any time by exporting a different `AWS_PROFILE` value.
+5. Switch to another profile:
 
-    ```shell
-    $ export AWS_PROFILE=teleport-awsic-dev-admin
-    ```
+   You can quickly switch to another profile at any time by exporting a different `AWS_PROFILE` value.
+
+   ```shell
+   $ export AWS_PROFILE=teleport-awsic-dev-admin
+   ```
 
 
 
