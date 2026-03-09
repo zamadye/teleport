@@ -34,7 +34,55 @@ Before you begin, you will need:
  * The AWS CLI tools, installed as per the AWS [installation guide](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html)
  * The SSO Start URL and AWS Region for your Identity Center organization. Ask your AWS administrator for the appropriate values.
 
-## Step 1/2. Configure the AWS SSO Session
+## Automatic Configuration
+
+The `tsh aws-profile` command automatically generates native AWS SSO profiles in `~/.aws/config` from your AWS Identity Center integration data.
+
+1.  Run the following command to generate the profiles:
+
+    ```shell
+    $ tsh aws-profile
+    AWS configuration updated at: /Users/alice/.aws/config
+    
+    Profile                    Account Account ID   Role   SSO Session
+    -------------------------- ------- ------------ ------ ----------------
+    teleport-awsic-dev-admin   dev     123456789012 Admin  teleport-d-12345
+    teleport-awsic-prod-reader prod    098765432109 Reader teleport-d-12345
+    ```
+
+2.  Select a profile and export it to the `AWS_PROFILE` environment variable. For example:
+
+    ```shell
+    $ export AWS_PROFILE=teleport-awsic-prod-reader
+    ```
+
+3.  Authenticate with AWS SSO:
+
+    ```shell
+    $ aws sso login
+    ```
+
+    This will open a browser window to complete the authentication process via Teleport.
+
+4.  Verify the configuration:
+
+    ```shell
+    $ aws sts get-caller-identity
+    ```
+
+5.  Switch to another profile:
+
+    You can quickly switch to another profile at any time by exporting a different `AWS_PROFILE` value.
+
+    ```shell
+    $ export AWS_PROFILE=teleport-awsic-dev-admin
+    ```
+
+
+
+## Alternative: Manual Configuration
+
+### Step 1/2. Configure the AWS SSO Session
 
 This step configures the AWS CLI tools to use SSO for authentication. You can
 either configure this manually, or via the `aws configure sso-session` wizard.
@@ -59,7 +107,7 @@ SSO region [None]: us-east-1
 SSO registration scopes [sso:account:access]:
 ```
 </TabItem>
-<TabItem label="Manual Configuration">
+<TabItem label="Manual Edit">
 You can configure SSO authentication manually by editing your `.aws/config` file. The above example would look like this:
 
 ```ini
@@ -71,7 +119,7 @@ sso_registration_scopes = sso:account:access
 </TabItem>
 </Tabs>
 
-### Testing the SSO Session
+#### Testing the SSO Session
 
 To test the SSO configuration, try logging into AWS via SSO.
 
@@ -82,7 +130,7 @@ $ aws sso login --sso-session my-identity-center
 This will launch a browser-based flow that will log you into AWS via Teleport
 and ask you confirm the AWS CLI tool's access to AWS using your account.
 
-## Step 2/2. Creating AWS Profiles
+### Step 2/2. Creating AWS Profiles
 
 You will need to create a separate AWS CLI profile for each AWS Account and Permission Set
 you want to access. These profiles will reference the SSO Session created above,
@@ -137,7 +185,7 @@ output format, etc), the wizard will ask for the profile name. For this example,
 given that the profile will use the `AdminAccess` role on the `Staging` account
 we will call it `admin-on-staging`.
 </TabItem>
-<TabItem label="Manual Configuration">
+<TabItem label="Manual Edit">
 While helpful, the `aws configure sso` wizard requires currently-assigned Accounts
 and Permission Sets to work with. You can pre-configure an AWS profile to use
 Account Assignments that you currently do not have access to by editing your 
@@ -155,7 +203,7 @@ region = us-east-1
 </TabItem>
 </Tabs>
 
-### Testing the profile
+#### Testing the profile
 
 You can test the profile by running `aws sts get-caller-identity` and verifying
 the returned user ID and assumed Role. For example:
