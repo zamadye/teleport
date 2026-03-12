@@ -179,23 +179,6 @@ Arguments:
 |---|---|---|
 |command|none (optional)|AWS command and subcommands arguments that are going to be forwarded to AWS CLI.|
 
-## tsh aws-profile
-
-Write AWS profiles retrieved from the AWS IAM Identity Center integration to the AWS config file.
-
-Usage:
-
-```code
-$ tsh aws-profile [<flags>]
-```
-
-Flags:
-
-|Flag|Default|Description|
-|---|---|---|
-|`--aws-sso-region`|none|AWS region for SSO. Auto-detected from cluster if not specified.|
-|`--dry-run`|`false`|Print the configuration that will be applied without modifying the AWS config file.|
-
 ## tsh az
 
 Access Azure API.
