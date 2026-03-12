@@ -35,8 +35,18 @@ Before you begin, you will need:
  * The SSO Start URL and AWS Region for your Identity Center organization. Ask your AWS administrator for the appropriate values.
 
 ## Automatic Configuration
+<Admonition type="note">
+  Use `tsh` client version 18.8.x or later in order to use the `tsh aws-profile` command.
+</Admonition>
 
 The `tsh aws-profile` command automatically generates native AWS SSO profiles in `~/.aws/config` from your AWS Identity Center integration data.
+
+
+
+<Admonition type="tip">
+  Use `tsh aws-profile --dry-run` to preview the changes before they are
+  written to your AWS config file.
+</Admonition>
 
 1. Run the following command to generate the profiles:
 
