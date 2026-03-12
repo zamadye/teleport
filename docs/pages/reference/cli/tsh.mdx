@@ -179,6 +179,24 @@ Arguments:
 |---|---|---|
 |command|none (optional)|AWS command and subcommands arguments that are going to be forwarded to AWS CLI.|
 
+## tsh aws-profile
+
+Write AWS profiles retrieved from the AWS IAM Identity Center integration to the
+AWS config file.
+
+Usage:
+
+```code
+$ tsh aws-profile [<flags>]
+```
+
+Flags:
+
+|Flag|Default|Description|
+|---|---|---|
+|`--aws-sso-region`|none|AWS region for SSO. Auto-detected from cluster if not specified.|
+|`--[no-]dry-run`|`false`|Print the configuration that will be applied without modifying the AWS config file.|
+
 ## tsh az
 
 Access Azure API.
@@ -1196,6 +1214,8 @@ Flags:
 |`--as`|none|Configure custom Kubernetes user impersonation.|
 |`--as-groups`|none|Configure custom Kubernetes group impersonation.|
 |`-c`, `--cluster`|none|Specify the Teleport cluster to connect.|
+|`--exec-arg`|none|Arguments to pass to the executed command (can be specified multiple times).|
+|`--exec-cmd`|none|Command to execute when --exec is enabled. If not specified, defaults to $SHELL or /bin/bash. Implicitly enables exec mode.|
 |`-f`, `--format`|`unix`|Optional format to print the commands for setting environment variables, one of: unix, command-prompt, powershell, text. Default is unix.|
 |`--labels`|none|List of comma separated labels to filter by labels (e.g. key1=value1,key2=value2).|
 |`-n`, `--namespace`|none|Configure the default Kubernetes namespace.|
@@ -1613,6 +1633,7 @@ Flags:
 |Flag|Default|Description|
 |---|---|---|
 |`-f`, `--format`|`text`|Format output (text, json, yaml).|
+|`--[no-]client`|`false`|Show client information only (no server required).|
 |`-v`, `--[no-]verbose`|`false`|Show extra status information after successful login.|
 
 ## tsh update
