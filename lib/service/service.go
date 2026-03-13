@@ -2758,13 +2758,15 @@ func (process *TeleportProcess) initAuthService() error {
 		TLS:                  tlsConfig,
 		GetClientCertificate: connector.ClientGetCertificate,
 
-		APIConfig:     *apiConf,
-		LimiterConfig: cfg.Auth.Limiter,
-		AccessPoint:   authServer.Cache,
-		Component:     teleport.Component(teleport.ComponentAuth, process.id),
-		ID:            process.id,
-		Listener:      mux.TLS(),
-		Metrics:       authMetrics,
+		APIConfig:      *apiConf,
+		LimiterConfig:  cfg.Auth.Limiter,
+		CustomRateFunc: cfg.Auth.CustomRateFunc,
+
+		AccessPoint: authServer.Cache,
+		Component:   teleport.Component(teleport.ComponentAuth, process.id),
+		ID:          process.id,
+		Listener:    mux.TLS(),
+		Metrics:     authMetrics,
 	})
 	if err != nil {
 		return trace.Wrap(err)

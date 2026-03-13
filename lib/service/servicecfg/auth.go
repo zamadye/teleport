@@ -80,6 +80,11 @@ type AuthConfig struct {
 
 	Limiter limiter.Config
 
+	// CustomRateFunc overrides the per-endpoint custom rate
+	// limits used by the gRPC unary interceptor. When nil, the
+	// built-in default rates apply. Intended for testing.
+	CustomRateFunc limiter.CustomRateFunc
+
 	// NoAudit, when set to true, disables session recording and event audit
 	NoAudit bool
 

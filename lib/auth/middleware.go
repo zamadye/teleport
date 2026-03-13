@@ -88,6 +88,10 @@ type TLSServerConfig struct {
 	ID string
 	// Metrics are optional TLSServer metrics
 	Metrics *Metrics
+	// CustomRateFunc returns per-endpoint custom rate limits for the
+	// gRPC unary interceptor. If nil, the default getCustomRate
+	// function is used.
+	CustomRateFunc limiter.CustomRateFunc
 }
 
 // CheckAndSetDefaults checks and sets default values
@@ -176,6 +180,11 @@ func NewTLSServer(ctx context.Context, cfg TLSServerConfig) (*TLSServer, error) 
 	// authMiddleware authenticates request assuming TLS client authentication
 	// adds authentication information to the context
 	// and passes it to the API server
+	customRate := cfg.CustomRateFunc
+	if customRate == nil {
+		customRate = getCustomRate
+	}
+
 	authMiddleware := &Middleware{
 		Middleware: authz.Middleware{
 			ClusterName:   localClusterName.GetClusterName(),
@@ -183,6 +192,7 @@ func NewTLSServer(ctx context.Context, cfg TLSServerConfig) (*TLSServer, error) 
 			Handler:       apiServer,
 		},
 		Limiter:                limiter,
+		CustomRate:             customRate,
 		GRPCMetrics:            grpcMetrics,
 		OldestSupportedVersion: oldestSupportedVersion,
 		AlertCreator: func(ctx context.Context, a types.ClusterAlert) error {
@@ -352,6 +362,11 @@ type Middleware struct {
 	// AlertCreator if provided is used to generate a cluster alert when any
 	// unsupported connections are rejected.
 	AlertCreator func(ctx context.Context, a types.ClusterAlert) error
+
+	// CustomRate returns per-endpoint custom rate limits for the
+	// gRPC unary interceptor. If nil, all endpoints use the
+	// default rates from the limiter config.
+	CustomRate limiter.CustomRateFunc
 
 	// lastRejectedAlertTime is the timestamp at which the last alert
 	// was created in response to rejecting unsupported clients.
@@ -587,7 +602,7 @@ func (a *Middleware) UnaryInterceptors() []grpc.UnaryServerInterceptor {
 	return append(is,
 		interceptors.GRPCServerUnaryErrorInterceptor,
 		metadata.UnaryServerInterceptor,
-		a.Limiter.UnaryServerInterceptorWithCustomRate(getCustomRate),
+		a.Limiter.UnaryServerInterceptorWithCustomRate(a.CustomRate),
 		a.withAuthenticatedUserUnaryInterceptor,
 	)
 }
