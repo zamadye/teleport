@@ -89,13 +89,26 @@ func NewRateLimiter(config Config) (*RateLimiter, error) {
 	return &limiter, nil
 }
 
-// IsRateLimited checks if the provided token is currently rate-limited without
-// consuming any tokens. Returns true if the token would be rate-limited, false otherwise.
-// This is useful for checking rate limit status before executing expensive operations.
+// rateLimitKey combines a client token with the rate period so that
+// different rate configurations maintain independent buckets for the
+// same client IP. Without this, a call with a custom rate and a call
+// with the default rate would share a single TokenBucketSet, and
+// Update would constantly swap bucket periods - effectively making
+// per-endpoint custom rates useless.
+type rateLimitKey struct {
+	token     string
+	maxPeriod time.Duration
+}
+
+// IsRateLimited checks if the provided token is currently
+// rate-limited under the default rates, without consuming any
+// tokens. It returns true if the token would be rate-limited and
+// false otherwise.
 func (l *RateLimiter) IsRateLimited(token string) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	bucketSet, ok := l.rateLimits.GetIfExists(token)
+	key := rateLimitKey{token: token, maxPeriod: l.rates.MaxPeriod()}
+	bucketSet, ok := l.rateLimits.GetIfExists(key)
 	if !ok {
 		return false
 	}
@@ -124,7 +137,8 @@ func (l *RateLimiter) RegisterRequest(token string, customRate *ratelimit.RateSe
 	// We set the TTL as 10 times the rate period. E.g. if rate is 100 requests/second
 	// per client IP, the counters for this IP will expire after 10 seconds of inactivity.
 	ttl := rate.MaxPeriod()*10 + 1
-	bucketSet, err := utils.FnCacheGetWithTTL(context.TODO(), l.rateLimits, token, ttl,
+	key := rateLimitKey{token: token, maxPeriod: rate.MaxPeriod()}
+	bucketSet, err := utils.FnCacheGetWithTTL(context.TODO(), l.rateLimits, key, ttl,
 		func(ctx context.Context) (*ratelimit.TokenBucketSet, error) {
 			return ratelimit.NewTokenBucketSet(rate, l.clock), nil
 		},

@@ -506,6 +506,31 @@ func TestNoRates_CustomRateStillApplied(t *testing.T) {
 	require.Error(t, limiter.RegisterRequestWithCustomRate("token1", customRate))
 }
 
+func TestNoRates_CustomRateIndependentOfDefault(t *testing.T) {
+	t.Parallel()
+
+	clock := clockwork.NewFakeClock()
+	limiter, err := NewLimiter(Config{Clock: clock})
+	require.NoError(t, err)
+
+	customRate := ratelimit.NewRateSet()
+	err = customRate.Add(time.Minute, 1, 5)
+	require.NoError(t, err)
+
+	// Interleave custom-rate and no-rate calls from the same IP.
+	// Before the rateLimitKey fix, no-rate calls would clobber the
+	// custom-rate bucket via Update, resetting its token count.
+	for range 5 {
+		require.NoError(t, limiter.RegisterRequestWithCustomRate("10.0.0.1", customRate))
+		// These no-rate calls must not reset the custom-rate bucket.
+		for range 10 {
+			require.NoError(t, limiter.RegisterRequest("10.0.0.1"))
+		}
+	}
+	// Burst of 5 is now exhausted; the next custom-rate call must fail.
+	require.Error(t, limiter.RegisterRequestWithCustomRate("10.0.0.1", customRate))
+}
+
 func TestNoRates_IsRateLimited(t *testing.T) {
 	t.Parallel()
 
