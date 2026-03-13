@@ -15,6 +15,7 @@ tags:
 
 (!docs/pages/includes/database-access/how-it-works/iam.mdx db="AlloyDB" cloud="Google Cloud"!)
 
+
 ![Teleport Architecture for AlloyDB Access](../../../../../img/database-access/guides/alloydb/architecture.png)
 
 ## Prerequisites
@@ -39,14 +40,12 @@ You need two service accounts:
 
 Go to [Service Accounts](https://console.cloud.google.com/iam-admin/serviceaccounts)
 and create a service account named `teleport-db-service`.
-
 Assign the predefined [`roles/alloydb.client`](https://cloud.google.com/alloydb/docs/reference/iam-roles-permissions) role.
 
 </TabItem>
 <TabItem label="gcloud CLI">
 
 Set <Var name="project-id" /> to your GCP project ID.
-
 ```code
 $ gcloud iam service-accounts create teleport-db-service \
     --display-name="Teleport Database Service"
@@ -62,7 +61,7 @@ $ gcloud projects add-iam-policy-binding <Var name="project-id" /> \
 ### Create the database user account
 
 <Admonition type="note">
-  If you already have a GCP service account for database access with the required roles, you can use it instead.
+If you already have a GCP service account for database access with the required roles, you can use it instead.
 </Admonition>
 
 <Tabs>
@@ -70,14 +69,13 @@ $ gcloud projects add-iam-policy-binding <Var name="project-id" /> \
 
 Go to [Service Accounts](https://console.cloud.google.com/iam-admin/serviceaccounts)
 and create a service account named `alloydb-user`.
-
 Assign these roles:
-- `roles/alloydb.databaseUser`
-- `roles/alloydb.client`
-- [`roles/serviceusage.serviceUsageConsumer`](https://cloud.google.com/service-usage/docs/access-control#serviceusage.serviceUsageConsumer)
+
+* `roles/alloydb.databaseUser`
+* `roles/alloydb.client`
+* [`roles/serviceusage.serviceUsageConsumer`](https://cloud.google.com/service-usage/docs/access-control#serviceusage.serviceUsageConsumer)
 
 Then, on the `alloydb-user` overview page, go to the "Principals with Access" tab, click "Grant Access", and add `teleport-db-service` with the **Service Account Token Creator** role.
-
 </TabItem>
 <TabItem label="gcloud CLI">
 
@@ -85,10 +83,11 @@ Then, on the `alloydb-user` overview page, go to the "Principals with Access" ta
 $ gcloud iam service-accounts create alloydb-user \
     --display-name="AlloyDB User"
 
-$ for role in roles/alloydb.databaseUser roles/alloydb.client roles/serviceusage.serviceUsageConsumer; do \
+$ for role in roles/alloydb.databaseUser roles/alloydb.client roles/serviceusage.serviceUsageConsumer;
+do \
     gcloud projects add-iam-policy-binding <Var name="project-id" /> \
       --member="serviceAccount:alloydb-user@<Var name="project-id" />.iam.gserviceaccount.com" \
-      --role="$role"; \
+      --role="$role";
   done
 
 $ gcloud iam service-accounts add-iam-policy-binding \
@@ -103,17 +102,16 @@ $ gcloud iam service-accounts add-iam-policy-binding \
 ### Add the IAM database user to AlloyDB
 
 <Admonition type="note">
-  Skip this if your AlloyDB instance already has an IAM user for this service account.
+Skip this if your AlloyDB instance already has an IAM user for this service account.
 </Admonition>
 
 Ensure [IAM authentication](https://cloud.google.com/alloydb/docs/database-users/manage-iam-auth) is enabled on your instance (the `alloydb.iam_authentication` flag must be set).
-
 Go to the Users page of your AlloyDB instance, click "Add User Account", choose "Cloud IAM" authentication, and add `alloydb-user`.
 
 ## Step 2/4: Set up the Database Service host
 
 <Admonition type="note">
-  If you already have a host running the Teleport Database Service with the `teleport-db-service` credentials, skip to Step 3.
+If you already have a host running the Teleport Database Service with the `teleport-db-service` credentials, skip to Step 3.
 </Admonition>
 
 Create a GCE instance and attach the `teleport-db-service` service account in the "Identity and API access" section.
@@ -132,26 +130,31 @@ Create a GCE instance and attach the `teleport-db-service` service account in th
 <TabItem label="gcloud CLI">
 
 If you have an existing GCE instance, you can attach the service account using the `gcloud` command-line tool.
-
 Set the variables:
-- <Var name="instance-name" /> instance name
-- <Var name="zone" /> instance zone
-- <Var name="project-id" /> GCP project ID
+
+* <Var name="instance-name" /> instance name
+* <Var name="zone" /> instance zone
+* <Var name="project-id" /> GCP project ID
 
 ```code
+# The instance must be stopped before modifying the service account
 $ gcloud compute instances stop <Var name="instance-name" /> --zone=<Var name="zone" />
 
+# Attach the service account with the 'cloud-platform' scope to allow IAM roles 
+# to govern all API access
 $ gcloud compute instances set-service-account <Var name="instance-name" />                 \
     --service-account=teleport-db-service@<Var name="project-id" />.iam.gserviceaccount.com \
+    --scopes=[https://www.googleapis.com/auth/cloud-platform](https://www.googleapis.com/auth/cloud-platform) \
     --zone=<Var name="zone" />
 
 $ gcloud compute instances start <Var name="instance-name" /> --zone=<Var name="zone" />
 ```
 
-Verify the instance is running with the correct service account:
+Verify the instance is running with the correct service account and scopes:
+
 ```code
 $ gcloud compute instances describe <Var name="instance-name" /> --zone=<Var name="zone" /> \
-   --format="yaml(status,serviceAccounts)"
+   --format="table(status,serviceAccounts[0].email,serviceAccounts[0].scopes.list())"
 ```
 
 </TabItem>
@@ -163,23 +166,41 @@ If running on a non-GCE host, use [workload identity federation](https://cloud.g
 <details>
 <summary>Using service account keys (not recommended for production)</summary>
 
-Create a JSON key for the `teleport-db-service` account and set the environment variable:
+Create a JSON key for the `teleport-db-service` account. If you use `systemd` to start Teleport, add the environment variable to the service's `EnvironmentFile`:
+
 ```code
-$ echo 'GOOGLE_APPLICATION_CREDENTIALS=/path/to/credentials.json' | sudo tee -a /etc/default/teleport
+$ echo 'GOOGLE_APPLICATION_CREDENTIALS=/path/to/credentials.json' | \
+sudo tee -a /etc/default/teleport
 ```
 
 <Admonition type="warning">
-Service account keys are a security risk. Use workload identity or attached service accounts in production. See [Google Cloud authentication docs](https://cloud.google.com/docs/authentication#service-accounts) for details.
+Service account keys are a security risk. Use workload identity or attached service accounts in production.
+See [Google Cloud authentication docs](https://cloud.google.com/docs/authentication#service-accounts) for details.
 </Admonition>
 </details>
 
-## Step 3/4: Configure and start Teleport
+## Step 3/4: Configure Teleport
+### Install the Teleport Database Service
 
 (!docs/pages/includes/install-linux.mdx!)
 
+### Create a join token
+
 (!docs/pages/includes/tctl-token.mdx serviceName="Database" tokenType="db" tokenFile="/tmp/token"!)
 
-Replace `<Var name="teleport.example.com:443" />` with your Teleport Proxy address and `<Var name="connection-uri" />` with your AlloyDB connection URI (format: `projects/PROJECT/locations/REGION/clusters/CLUSTER/instances/INSTANCE`, found on the instance details page).
+### Configure and start the Database Service
+
+In the command below, replace `<Var name="teleport.example.com:443" />` with the
+host and port of your Teleport Proxy Service or Enterprise Cloud site, and
+replace `<Var name="connection-uri" />` with your AlloyDB connection URI.
+
+The connection URI has the format `projects/PROJECT/locations/REGION/clusters/CLUSTER/instances/INSTANCE`.
+You can copy it from the AlloyDB instance details page in the Google Cloud
+console.
+
+![AlloyDB Connection URI](../../../../../img/database-access/guides/alloydb/connection-uri.png)
+
+Run the command as follows. Make sure to include the mandatory `alloydb://` prefix in the specified URI.
 
 ```code
 $ sudo teleport db configure create \
@@ -193,7 +214,8 @@ $ sudo teleport db configure create \
 ```
 
 <Admonition type="tip" title="Endpoint type">
-By default, Teleport uses the private AlloyDB endpoint. To use [public](https://cloud.google.com/alloydb/docs/connect-public-ip) or [PSC](https://cloud.google.com/alloydb/docs/about-private-service-connect) endpoints, set `endpoint_type` in the config:
+By default, Teleport uses the private AlloyDB endpoint.
+To use [public](https://cloud.google.com/alloydb/docs/connect-public-ip) or [PSC](https://cloud.google.com/alloydb/docs/about-private-service-connect) endpoints, set `endpoint_type` in the config:
 
 ```yaml
 db_service:
@@ -205,6 +227,7 @@ db_service:
         alloydb:
           endpoint_type: public  # private | public | psc
 ```
+
 </Admonition>
 
 <details>
@@ -225,6 +248,7 @@ spec:
   gcp:
     alloydb:
       endpoint_type: private
+
 ```
 
 Apply it:
@@ -239,7 +263,10 @@ Start the Database Service:
 
 (!docs/pages/includes/start-teleport.mdx service="the Teleport Database Service"!)
 
-## Step 4/4: Connect
+## Step 4/4: Connect to your database
+
+You will only be able to see databases that your Teleport role has access to. 
+See our [RBAC guide](../../../../zero-trust-access/rbac-get-started/rbac-get-started.mdx) for more details.
 
 (!docs/pages/includes/database-access/create-user.mdx!)
 
@@ -253,6 +280,7 @@ $ tsh db ls
 # alloydb GCP AlloyDB env=dev
 ```
 
+The database user name is shown on the Users page of your AlloyDB instance. 
 Connect using the service account name (minus `.gserviceaccount.com`):
 
 ```code
@@ -260,7 +288,8 @@ $ tsh db connect --db-user=alloydb-user@<Var name="project-id"/>.iam --db-name=p
 ```
 
 <Admonition type="tip">
-  From version `17.1`, you can also [connect via the Web UI](../../../../connect-your-client/teleport-clients/web-ui.mdx#starting-a-database-session).
+From version `17.1`, you can also 
+[connect via the Web UI](../../../../connect-your-client/teleport-clients/web-ui.mdx#starting-a-database-session).
 </Admonition>
 
 To log out:
@@ -276,27 +305,33 @@ $ tsh db logout
 For tighter security, replace the predefined roles with custom roles containing only the required permissions.
 
 **For `teleport-db-service`:**
-- `alloydb.clusters.generateClientCertificate`
-- `alloydb.instances.connect`
-- `iam.serviceAccounts.getAccessToken` (replaces the broader "Service Account Token Creator" role)
+
+* `alloydb.clusters.generateClientCertificate`
+* `alloydb.instances.connect`
+* `iam.serviceAccounts.getAccessToken` (replaces the broader "Service Account Token Creator" role)
 
 **For `alloydb-user`:**
-- `alloydb.instances.connect`
-- `alloydb.users.login`
-- `serviceusage.services.use`
+
+* `alloydb.instances.connect`
+* `alloydb.users.login`
+* `serviceusage.services.use`
 
 ## Troubleshooting
 
-(!docs/pages/includes/database-access/gcp-troubleshooting.mdx!)
+<Checkpoint
+  title="Unable to connect to the database"
+  description="Confirm that you can access the database without errors."
+>
+  Here are some common errors and troubleshooting tips:
 
-(!docs/pages/includes/database-access/pg-cancel-request-limitation.mdx!)
-
-(!docs/pages/includes/database-access/psql-ssl-syscall-error.mdx!)
+  - (!docs/pages/includes/database-access/gcp-troubleshooting.mdx!)
+  - (!docs/pages/includes/database-access/pg-cancel-request-limitation.mdx!)
+  - (!docs/pages/includes/database-access/psql-ssl-syscall-error.mdx!)
+</Checkpoint>
 
 ## Next steps
 
-(!docs/pages/includes/database-access/guides-next-steps.mdx!)
+* Learn more about [IAM authentication for AlloyDB](https://cloud.google.com/alloydb/docs/database-users/manage-iam-auth).
+* Learn more about [service account authentication](https://cloud.google.com/docs/authentication#service-accounts) in Google Cloud.
+* Learn more about AlloyDB [Auth Proxy permissions](https://cloud.google.com/alloydb/docs/auth-proxy/connect#required-iam-permissions).
 
-- Learn more about [IAM authentication for AlloyDB](https://cloud.google.com/alloydb/docs/database-users/manage-iam-auth).
-- Learn more about [service account authentication](https://cloud.google.com/docs/authentication#service-accounts) in Google Cloud.
-- Learn more about AlloyDB [Auth Proxy permissions](https://cloud.google.com/alloydb/docs/auth-proxy/connect#required-iam-permissions).
