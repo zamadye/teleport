@@ -43,6 +43,8 @@ option when using Teleport `tsh` client version 18.8.x or later.
 <TabItem label="tsh">
 The `tsh aws-profile` command automatically generates native AWS SSO profiles in
 `~/.aws/config` from your AWS Identity Center integration data.
+It preserves existing non-Teleport entries, updates Teleport-managed AWS Identity Center 
+sections, and removes stale Teleport-managed profiles and SSO sessions that are no longer available from the cluster you are currently logged into.
 
 <Admonition type="tip">
   Use `tsh aws-profile --dry-run` to preview the changes before they are
