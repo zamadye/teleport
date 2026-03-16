@@ -19,6 +19,7 @@
 package installer
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -26,6 +27,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/url"
 	"os"
 	"os/exec"
@@ -37,7 +39,6 @@ import (
 
 	"github.com/google/safetext/shsprintf"
 	"github.com/gravitational/trace"
-	"github.com/jonboulle/clockwork"
 
 	"github.com/gravitational/teleport/api"
 	"github.com/gravitational/teleport/api/types"
@@ -62,9 +63,33 @@ const (
 	// service before checking if the agent successfully joined the cluster.
 	defaultJoinCheckDelay = 30 * time.Second
 
+	// defaultInstallLockGracePeriod is additional time beyond joinCheckDelay to
+	// wait for the install lock before returning a lock contention error.
+	defaultInstallLockGracePeriod = 10 * time.Second
+
+	// defaultReadyzCheckTimeout is the timeout for a single readyz query.
+	defaultReadyzCheckTimeout = 10 * time.Second
+
+	// readyzStatusStartingKeyword marks a transient startup status in readyz.
+	readyzStatusStartingKeyword = "starting"
+
 	// maxReadyzStatusLen is the maximum number of runes to include from the readyz
 	// status message in error output and audit events.
 	maxReadyzStatusLen = 512
+
+	// readyzStatusTruncatedSuffix marks that the readyz status string was truncated to maxReadyzStatusLen.
+	readyzStatusTruncatedSuffix = "... (truncated)"
+
+	// maxJournalLines limits how many recent journalctl lines we capture before any
+	// filtering/truncation, to keep collection bounded.
+	maxJournalLines = 50
+
+	// maxJournalOutputLen limits the size of journal output text embedded into wrapped
+	// errors and audit-facing stderr payloads after capture/filtering.
+	maxJournalOutputLen = 4096
+
+	// journalOutputTruncatedSuffix marks that embedded journal output text was truncated to maxJournalOutputLen.
+	journalOutputTruncatedSuffix = "... (truncated)"
 )
 
 // ErrJoinFailure is returned when the Teleport agent is installed but fails to join the cluster.
@@ -135,8 +160,15 @@ type AutoDiscoverNodeInstallerConfig struct {
 	// querying the readyz endpoint. Defaults to defaultJoinCheckDelay (30s).
 	joinCheckDelay time.Duration
 
-	// clock is used for time-dependent operations. Defaults to a real clock.
-	clock clockwork.Clock
+	// installLockWaitTimeout is how long to wait for the install lock before
+	// returning a lock contention error. Defaults to joinCheckDelay +
+	// defaultInstallLockGracePeriod.
+	// Used for testing.
+	installLockWaitTimeout time.Duration
+
+	// readyzCheck, when set, replaces the default debug-socket readyz call.
+	// Used for testing.
+	readyzCheck func(ctx context.Context) (debug.Readiness, error)
 }
 
 func (c *AutoDiscoverNodeInstallerConfig) checkAndSetDefaults() error {
@@ -188,8 +220,9 @@ func (c *AutoDiscoverNodeInstallerConfig) checkAndSetDefaults() error {
 	if c.joinCheckDelay == 0 {
 		c.joinCheckDelay = defaultJoinCheckDelay
 	}
-	if c.clock == nil {
-		c.clock = clockwork.NewRealClock()
+
+	if c.installLockWaitTimeout == 0 {
+		c.installLockWaitTimeout = c.joinCheckDelay + defaultInstallLockGracePeriod
 	}
 
 	if len(c.imdsProviders) == 0 {
@@ -269,30 +302,22 @@ func (ani *AutoDiscoverNodeInstaller) Install(ctx context.Context) error {
 		)
 	}
 
-	// Install and configure under the file lock. If the lock is held by another installer,
-	// exit successfully and let that installer handle the full install + health check cycle.
-	installed, err := ani.installAndConfigure(ctx)
-	if err != nil {
-		return trace.Wrap(err)
-	}
-	if !installed {
-		return nil
-	}
-
-	// Health check runs after the lock is released because it only reads the debug socket and
-	// holding the lock during the 30s delay would block concurrent invocations from discovery re-polls.
-	return trace.Wrap(ani.checkJoinHealth(ctx))
+	// Install, configure, and health-check all run under the install lock.
+	return trace.Wrap(ani.installAndConfigure(ctx))
 }
 
-// installAndConfigure acquires the install lock and performs the install and configuration steps.
-// Returns true if the install ran, false if the lock was held by another installer.
-func (ani *AutoDiscoverNodeInstaller) installAndConfigure(ctx context.Context) (bool, error) {
+// installAndConfigure acquires the install lock and performs the install, configuration,
+// and health-check steps. The health check runs under the lock to prevent a concurrent
+// installer from restarting Teleport while we're waiting for the readyz result.
+func (ani *AutoDiscoverNodeInstaller) installAndConfigure(ctx context.Context) error {
 	// Ensure only one installer is running by locking the same file as the script installers.
 	lockFile := ani.buildAbsoluteFilePath(exclusiveInstallFileLock)
-	unlockFn, err := utils.FSTryWriteLock(lockFile)
+	unlockFn, err := utils.FSTryWriteLockTimeout(ctx, lockFile, ani.installLockWaitTimeout)
 	if err != nil {
-		ani.Logger.WarnContext(ctx, "Another installer is running, skipping", "lock", lockFile)
-		return false, nil
+		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+			return trace.BadParameter("Could not get lock %s. Either remove it or wait for the other installer to finish.", lockFile)
+		}
+		return trace.Wrap(err, "acquiring install lock %s", lockFile)
 	}
 	defer func() {
 		if err := unlockFn(); err != nil {
@@ -302,7 +327,7 @@ func (ani *AutoDiscoverNodeInstaller) installAndConfigure(ctx context.Context) (
 
 	imdsClient, err := ani.getIMDSClient(ctx)
 	if err != nil {
-		return false, trace.Wrap(err)
+		return trace.Wrap(err)
 	}
 	ani.Logger.InfoContext(ctx, "Detected cloud provider", "cloud", imdsClient.GetType())
 
@@ -314,12 +339,12 @@ func (ani *AutoDiscoverNodeInstaller) installAndConfigure(ctx context.Context) (
 		// then this is an error because teleport-update should have installed it.
 		// This prevents the installer from installing teleport in a different version and/or location than the one managed by teleport-update.
 		if ani.InstallationManagedByTeleportUpdateWithSuffix != "" {
-			return false, trace.BadParameter("teleport binary not found, ensure teleport-update installed it correctly: %v", err)
+			return trace.BadParameter("teleport binary not found, ensure teleport-update installed it correctly: %v", err)
 		}
 
 		ani.Logger.InfoContext(ctx, "Installing teleport")
 		if err := ani.installTeleportFromRepo(ctx); err != nil {
-			return false, trace.Wrap(err)
+			return trace.Wrap(err)
 		}
 	}
 
@@ -329,12 +354,13 @@ func (ani *AutoDiscoverNodeInstaller) installAndConfigure(ctx context.Context) (
 				"configuration_file", ani.buildTeleportConfigurationPath(),
 				"systemd_service", ani.buildTeleportSystemdUnitName(),
 			)
-			// Restarting teleport is not required because the target teleport.yaml
-			// is up to date with the existing one.
-			return true, nil
+			// Config unchanged, so skip restart but still run a health check. This preserves visibility into
+			// lingering join/service failures on subsequent polls. Because this run did not restart the service,
+			// run a non-fresh check (fail fast for "still starting").
+			return trace.Wrap(ani.checkJoinHealth(ctx, false))
 		}
 
-		return false, trace.Wrap(err)
+		return trace.Wrap(err)
 	}
 	ani.Logger.InfoContext(ctx, "Configuration written",
 		"configuration_file", ani.buildTeleportConfigurationPath(),
@@ -344,65 +370,318 @@ func (ani *AutoDiscoverNodeInstaller) installAndConfigure(ctx context.Context) (
 		"systemd_service", ani.buildTeleportSystemdUnitName(),
 	)
 	if err := ani.enableAndRestartTeleportService(ctx); err != nil {
-		return false, trace.Wrap(err)
+		return trace.Wrap(err)
 	}
 
-	return true, nil
+	// Health check runs while the install lock is still held, so another installer flow that
+	// uses this lock can't restart Teleport while we're waiting for the readyz result.
+	// This code path just restarted the service, so treat it as a fresh start.
+	return trace.Wrap(ani.checkJoinHealth(ctx, true))
 }
 
-// limitStatusLen truncates s to at most maxRunes runes, appending "... (truncated)" if the string was shortened.
-func limitStatusLen(s string, maxRunes int) string {
-	const suffix = "... (truncated)"
-	limit := max(maxRunes-len(suffix), 0) // suffix is ASCII-only, len == rune count
+// checkJoinHealth checks whether the Teleport service is running and has joined the cluster.
+// It checks immediately first (in case the service is already up from a previous run), and
+// only waits and retries if a delay can make the result more conclusive.
+//
+// freshStart should be true when this installer invocation restarted the service.
+// In that case, a transient readyz "starting" state is expected and gets one delayed retry.
+// When freshStart is false, "starting" is treated as a failure immediately to avoid
+// paying joinCheckDelay on every discovery poll for already-failing nodes.
+func (a *AutoDiscoverNodeInstaller) checkJoinHealth(ctx context.Context, freshStart bool) error {
+	serviceName := a.buildTeleportSystemdUnitName()
 
-	i := 0
-	for pos := range s {
-		if i >= limit {
-			return s[:pos] + suffix
-		}
-		i++
+	// First attempt: check immediately. If the service is already running and the
+	// debug socket is available, we get a fast answer without waiting.
+	result := a.doJoinHealthCheck(ctx, serviceName)
+	if result.definitive {
+		return result.err
 	}
-	return s
+
+	// Retry after joinCheckDelay only when a retry can change the outcome:
+	// - debug socket unavailable (startup race), or
+	// - fresh start with readyz reporting "starting".
+	// For non-fresh polls, a "starting" status is treated as a terminal failure
+	// to avoid waiting on every discovery loop for nodes that are already failing.
+	staleStartingPoll := result.starting && !freshStart
+	shouldWait := !staleStartingPoll
+	if shouldWait {
+		if a.joinCheckDelay > 0 {
+			a.Logger.InfoContext(ctx, "Agent not ready yet, waiting before retry", "delay", a.joinCheckDelay)
+			timer := time.NewTimer(a.joinCheckDelay)
+			defer timer.Stop()
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+				return trace.Wrap(ctx.Err())
+			}
+		}
+
+		result = a.doJoinHealthCheck(ctx, serviceName)
+		if result.err != nil {
+			return result.err
+		}
+	}
+
+	if !result.definitive && result.starting {
+		msg := "Teleport agent still starting"
+		if shouldWait {
+			// Still "starting" after the wait — the agent never joined. This is a real join failure.
+			msg = fmt.Sprintf("Teleport agent still starting after %s wait", a.joinCheckDelay)
+		}
+		err := trace.Wrap(ErrJoinFailure, msg)
+		return a.appendJournal(ctx, serviceName, err)
+	}
+
+	// Socket is still unavailable after retry and service checks are inconclusive.
+	// Treat this outcome as non-fatal.
+	return nil
 }
 
-// checkJoinHealth queries the Teleport debug socket's readyz endpoint to determine whether the agent has joined the cluster.
-func (a *AutoDiscoverNodeInstaller) checkJoinHealth(ctx context.Context) error {
-	// Give the agent time to attempt a cluster join before checking. This delay is always
-	// applied because even when the config already exists, the service may have been
-	// recently started by a concurrent SSM command and not yet completed its first join attempt.
-	if a.joinCheckDelay > 0 {
-		a.Logger.InfoContext(ctx, "Waiting before checking join health", "delay", a.joinCheckDelay)
-		timer := a.clock.NewTimer(a.joinCheckDelay)
-		defer timer.Stop()
-		select {
-		case <-timer.Chan():
-		case <-ctx.Done():
-			return trace.Wrap(ctx.Err())
+// healthCheckResult holds the outcome of a join health check.
+type healthCheckResult struct {
+	err error
+	// definitive is true when the check reached a conclusive result (success or failure).
+	// It is false when the debug socket was not available or the agent was still starting,
+	// meaning a retry after a delay may produce a different result.
+	definitive bool
+	// starting is true when the non-definitive result came from a "starting" readyz status.
+	// Distinguished from socket-absent so the caller can treat "still starting after wait"
+	// as a failure while treating socket-absent as benign (older Teleport without debug socket).
+	starting bool
+}
+
+// doJoinHealthCheck verifies the systemd unit is active and queries the readyz endpoint.
+func (a *AutoDiscoverNodeInstaller) doJoinHealthCheck(ctx context.Context, serviceName string) healthCheckResult {
+	// Check service status before readyz: a dead process can't serve the debug socket.
+	if err := a.checkServiceStatus(ctx, serviceName); err != nil {
+		return healthCheckResult{
+			err:        a.appendJournal(ctx, serviceName, err),
+			definitive: true,
 		}
 	}
 
-	clt := debug.NewClient(a.buildTeleportDataDirPath())
-
-	readiness, err := clt.GetReadiness(ctx)
+	reachable, starting, err := a.checkReadyz(ctx)
 	if err != nil {
-		// The debug socket may not exist if the process hasn't started yet or if the installed version predates
-		// the debug endpoint. Returning nil means the join status is unknown, a false negative. This is
-		// a deliberate tradeoff: failing open avoids blocking rollouts when the health check is unavailable,
-		// at the cost of missing some join failures.
-		a.Logger.WarnContext(ctx, "Debug socket not available, skipping join health check",
-			"socket", clt.SocketPath(), "error", err)
+		return healthCheckResult{err: a.appendJournal(ctx, serviceName, err), definitive: true}
+	}
+	if starting {
+		// Process is up but still starting — not definitive, retry after delay.
+		return healthCheckResult{definitive: false, starting: true}
+	}
+	if !reachable {
+		// Socket not available — not a definitive result.
+		return healthCheckResult{definitive: false}
+	}
+	return healthCheckResult{definitive: true}
+}
+
+// checkServiceStatus performs a best-effort systemd status check for the named unit.
+//
+// It returns a non-nil error only if systemctl reports a recognized non-active
+// state. Inconclusive results (infrastructure failures, unexpected output)
+// return nil.
+func (a *AutoDiscoverNodeInstaller) checkServiceStatus(ctx context.Context, serviceName string) error {
+	cmd := exec.CommandContext(ctx, a.binariesLocation.Systemctl, "is-active", serviceName)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+	if err != nil {
+		// A non-ExitError means the command itself failed to run (binary not
+		// found, permission denied, etc.) rather than reporting a non-active state.
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) {
+			a.Logger.WarnContext(ctx, "Unable to check service status",
+				"service", serviceName,
+				"error", err,
+				"stderr", strings.TrimSpace(stderr.String()),
+			)
+			return nil
+		}
+		// ExitError: systemctl ran but the service is not active.
+		// stdout is captured in the buffer regardless of exit code.
+	}
+
+	state := strings.TrimSpace(stdout.String())
+	stderrStr := strings.TrimSpace(stderr.String())
+
+	// systemctl is-active normally emits a state string (active, inactive, failed, etc.).
+	// Empty output is unexpected; log and let the caller fall through to readyz.
+	if state == "" {
+		a.Logger.WarnContext(ctx, "systemctl is-active produced no output",
+			"service", serviceName,
+			"stderr", stderrStr,
+		)
 		return nil
 	}
 
-	if !readiness.Ready {
-		status := limitStatusLen(readiness.Status, maxReadyzStatusLen)
-
-		a.Logger.WarnContext(ctx, "Teleport agent failed to join the cluster", "status", status)
-		return trace.Wrap(ErrJoinFailure, "Teleport agent failed to join the cluster: %s", status)
+	// "activating" means systemd is still starting the unit — the process may
+	// come up shortly. Return nil so the caller falls through to readyz.
+	if state == "activating" {
+		a.Logger.InfoContext(ctx, "Service is still activating",
+			"service", serviceName)
+		return nil
 	}
 
-	a.Logger.InfoContext(ctx, "Teleport agent is ready and has joined the cluster")
+	if state != "active" {
+		return trace.Wrap(
+			ErrJoinFailure,
+			"service %s is not active (state: %q, stderr: %s)",
+			serviceName,
+			state,
+			stderrStr,
+		)
+	}
+
+	a.Logger.DebugContext(ctx, "Service is active", "service", serviceName)
 	return nil
+}
+
+// checkReadyz queries the Teleport debug socket's readyz endpoint to determine whether the agent
+// has joined the cluster. It applies a 10s timeout to avoid hanging on a wedged process.
+//
+// Return values:
+//   - (true, false, nil)   — agent is ready
+//   - (true, true,  nil)   — socket reachable but agent still starting (transient)
+//   - (true, false, error) — definitive readyz failure
+//   - (false, false, nil)  — debug socket unavailable
+func (a *AutoDiscoverNodeInstaller) checkReadyz(ctx context.Context) (reachable, starting bool, err error) {
+	ctx, cancel := context.WithTimeout(ctx, defaultReadyzCheckTimeout)
+	defer cancel()
+
+	var readiness debug.Readiness
+	if a.readyzCheck != nil {
+		readiness, err = a.readyzCheck(ctx)
+	} else {
+		clt := debug.NewClient(a.buildTeleportDataDirPath())
+		readiness, err = clt.GetReadiness(ctx)
+	}
+	if err != nil {
+		// Socket genuinely absent (connection error) or endpoint doesn't exist
+		// (NotFound on older builds) — signal "not reachable" so the caller can retry.
+		if isConnectionError(err) || trace.IsNotFound(err) {
+			a.Logger.DebugContext(ctx, "Debug socket unavailable", "error", trace.UserMessage(err))
+			return false, false, nil
+		}
+		return true, false, trace.Wrap(ErrJoinFailure, "readyz check failed: %v", err)
+	}
+
+	if readiness.Ready {
+		a.Logger.InfoContext(ctx, "Teleport agent is ready and has joined the cluster")
+		return true, false, nil
+	}
+
+	status := utils.TruncateRunesWithSuffix(readiness.Status, maxReadyzStatusLen, readyzStatusTruncatedSuffix)
+
+	// "starting" is transient — the process is up but hasn't joined yet.
+	// Signal the caller to retry after a delay instead of treating this as
+	// a definitive failure.
+	if strings.Contains(readiness.Status, readyzStatusStartingKeyword) {
+		a.Logger.InfoContext(ctx, "Teleport agent is still starting", "status", status)
+		return true, true, nil
+	}
+
+	return true, false, trace.Wrap(ErrJoinFailure, "Teleport agent failed to join the cluster: %s", status)
+}
+
+// isConnectionError returns true when the error indicates a socket-level connection
+// failure (e.g. file not found, connection refused), as opposed to an HTTP or
+// application-level error.
+func isConnectionError(err error) bool {
+	var opErr *net.OpError
+	return errors.As(err, &opErr)
+}
+
+// appendJournal enriches err with recent service log lines for the given systemd unit.
+// If no output is available, the original error is returned unchanged.
+func (a *AutoDiscoverNodeInstaller) appendJournal(ctx context.Context, serviceName string, err error) error {
+	journalOutput := a.captureJournal(ctx, serviceName)
+	journalOutput = filterJournalErrors(journalOutput)
+	if journalOutput == "" {
+		return err
+	}
+	journalOutput = utils.TruncateRunesWithSuffix(journalOutput, maxJournalOutputLen, journalOutputTruncatedSuffix)
+
+	return trace.Wrap(err, "\n\nJournal output:\n%s", journalOutput)
+}
+
+// captureJournal is a best-effort helper that runs journalctl to retrieve recent log
+// lines for the given systemd unit.
+// Stderr is logged internally but not returned, to keep caller-facing diagnostics
+// focused on journal contents.
+func (a *AutoDiscoverNodeInstaller) captureJournal(ctx context.Context, serviceName string) string {
+	args := []string{
+		"--unit", serviceName,
+		"--no-pager",
+		"--lines", fmt.Sprintf("%d", maxJournalLines),
+	}
+
+	cmd := exec.CommandContext(ctx, a.binariesLocation.Journalctl, args...)
+	var stdoutBuf, stderrBuf bytes.Buffer
+	cmd.Stdout = &stdoutBuf
+	cmd.Stderr = &stderrBuf
+
+	err := cmd.Run()
+	stderrOutput := strings.TrimSpace(stderrBuf.String())
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			a.Logger.DebugContext(ctx, "journalctl exited non-zero", "service", serviceName, "exit_code", exitErr.ExitCode(), "stderr", stderrOutput)
+		} else {
+			a.Logger.WarnContext(ctx, "Failed to capture journal output", "service", serviceName, "error", err, "stderr", stderrOutput)
+		}
+	}
+
+	return strings.TrimSpace(stdoutBuf.String())
+}
+
+// filterJournalErrors filters journal output to reduce noise while preserving
+// useful diagnostics. Teleport INFO lines are dropped (startup/retry noise),
+// but ERRO/WARN lines are kept and deduplicated. Non-Teleport lines (systemd,
+// kernel, AppArmor) are always kept, since they may be the only evidence when
+// Teleport crashes before logging initializes.
+func filterJournalErrors(output string) string {
+	var filtered []string
+	var lastDedupKey string
+
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		isTeleportLog := strings.Contains(line, "ERRO") || strings.Contains(line, "WARN") || strings.Contains(line, "INFO")
+		if isTeleportLog && !strings.Contains(line, "ERRO") && !strings.Contains(line, "WARN") {
+			// Teleport INFO line — skip.
+			continue
+		}
+
+		// For Teleport ERRO/WARN lines, deduplicate by stripping variable parts
+		// (timestamps, component tags like "[PROC:1]", trailing "pid:NNN.N file.go:line").
+		if strings.Contains(line, "ERRO") || strings.Contains(line, "WARN") {
+			dedupKey := line
+			if idx := strings.Index(dedupKey, "ERRO"); idx >= 0 {
+				dedupKey = dedupKey[idx:]
+			} else if idx := strings.Index(dedupKey, "WARN"); idx >= 0 {
+				dedupKey = dedupKey[idx:]
+			}
+			if start := strings.Index(dedupKey, "]"); start >= 0 {
+				dedupKey = dedupKey[:5] + dedupKey[start+1:]
+			}
+			if idx := strings.LastIndex(dedupKey, " pid:"); idx >= 0 {
+				dedupKey = dedupKey[:idx]
+			}
+			if dedupKey == lastDedupKey {
+				continue
+			}
+			lastDedupKey = dedupKey
+		}
+
+		filtered = append(filtered, line)
+	}
+
+	return strings.TrimSpace(strings.Join(filtered, "\n"))
 }
 
 // enableAndRestartTeleportService will enable and (re)start the teleport.service.
