@@ -27,13 +27,13 @@ tags:
 - A host (e.g., a Compute Engine instance) to run the Teleport Database Service.
 - (!docs/pages/includes/tctl.mdx!)
 
-## Step 1/4: Configure GCP IAM and database user
+## Step 1/4: Configure IAM and create a database user
 
 You need two service accounts:
 - `teleport-db-service`: used by the Teleport Database Service to access AlloyDB metadata and generate tokens.
 - `alloydb-user`: used by end-users to authenticate to the database.
 
-### Create the Database Service account
+### Create a service account for the Teleport Database Service
 
 <Tabs>
 <TabItem label="Google Cloud Console">
@@ -105,10 +105,43 @@ $ gcloud iam service-accounts add-iam-policy-binding \
 Skip this if your AlloyDB instance already has an IAM user for this service account.
 </Admonition>
 
-Ensure [IAM authentication](https://cloud.google.com/alloydb/docs/database-users/manage-iam-auth) is enabled on your instance (the `alloydb.iam_authentication` flag must be set).
-Go to the Users page of your AlloyDB instance, click "Add User Account", choose "Cloud IAM" authentication, and add `alloydb-user`.
+Ensure [IAM authentication](https://cloud.google.com/alloydb/docs/database-users/manage-iam-auth) 
+is enabled on your instance (the `alloydb.iam_authentication` flag must be set).
 
-## Step 2/4: Set up the Database Service host
+<Tabs>
+<TabItem label="Google Cloud Console">
+
+1. Go to the Users page of your AlloyDB instance.
+2. Click Add User Account.
+3. Choose Cloud IAM authentication.
+4. Add alloydb-user.
+
+</TabItem>
+<TabItem label="gcloud CLI">
+
+  Enable IAM authentication on your instance:
+
+```code
+$ gcloud alloydb instances update <Var name="instance-name" /> \
+    --cluster=<Var name="cluster-name" /> \
+    --region=<Var name="region" /> \
+    --database-flags=alloydb.iam_authentication=on
+```
+  Create the IAM-based database user to link the service account to the database:
+
+```code
+$ gcloud alloydb users create alloydb-user@<Var name="project-id" />.iam \
+    --cluster=<Var name="cluster-name" /> \
+    --region=<Var name="region" /> \
+    --type=IAM_BASED
+```
+
+</TabItem>
+</Tabs>
+
+## Step 2/4: Create a Teleport Database Service host
+
+The Teleport Database Service must run on a host that can reach the AlloyDB instance and authenticate with GCP.
 
 <Admonition type="note">
 If you already have a host running the Teleport Database Service with the `teleport-db-service` credentials, skip to Step 3.
@@ -144,7 +177,7 @@ $ gcloud compute instances stop <Var name="instance-name" /> --zone=<Var name="z
 # to govern all API access
 $ gcloud compute instances set-service-account <Var name="instance-name" />                 \
     --service-account=teleport-db-service@<Var name="project-id" />.iam.gserviceaccount.com \
-    --scopes=[https://www.googleapis.com/auth/cloud-platform](https://www.googleapis.com/auth/cloud-platform) \
+    --scopes=https://www.googleapis.com/auth/cloud-platform \
     --zone=<Var name="zone" />
 
 $ gcloud compute instances start <Var name="instance-name" /> --zone=<Var name="zone" />
@@ -154,7 +187,7 @@ Verify the instance is running with the correct service account and scopes:
 
 ```code
 $ gcloud compute instances describe <Var name="instance-name" /> --zone=<Var name="zone" /> \
-   --format="table(status,serviceAccounts[0].email,serviceAccounts[0].scopes.list())"
+   --format="value(serviceAccounts[0].scopes)"
 ```
 
 </TabItem>
@@ -194,7 +227,7 @@ In the command below, replace `<Var name="teleport.example.com:443" />` with the
 host and port of your Teleport Proxy Service or Enterprise Cloud site, and
 replace `<Var name="connection-uri" />` with your AlloyDB connection URI.
 
-The connection URI has the format `projects/PROJECT/locations/REGION/clusters/CLUSTER/instances/INSTANCE`.
+The connection URI has the format `projects/PROJECT-ID/locations/REGION/clusters/CLUSTER/instances/INSTANCE`.
 You can copy it from the AlloyDB instance details page in the Google Cloud
 console.
 
@@ -222,7 +255,7 @@ db_service:
   resources:
     - name: alloydb
       protocol: postgres
-      uri: alloydb://projects/PROJECT/locations/REGION/clusters/CLUSTER/instances/INSTANCE
+      uri: alloydb://projects/PROJECT-ID/locations/REGION/clusters/CLUSTER/instances/INSTANCE
       gcp:
         alloydb:
           endpoint_type: public  # private | public | psc
@@ -275,9 +308,9 @@ Log in and list databases:
 ```code
 $ tsh login --proxy=teleport.example.com --user=alice
 $ tsh db ls
-# Name    Description Labels
-# ------- ----------- -------
-# alloydb GCP AlloyDB env=dev
+  Name    Description Labels
+  ------- ----------- -------
+  alloydb GCP AlloyDB env=dev
 ```
 
 The database user name is shown on the Users page of your AlloyDB instance. 
@@ -300,21 +333,41 @@ $ tsh db logout alloydb
 $ tsh db logout
 ```
 
-## Optional: least-privilege IAM roles
+## Optional: least-privilege access
 
-For tighter security, replace the predefined roles with custom roles containing only the required permissions.
+When possible, enforce least-privilege by defining custom IAM roles that grant only the required permissions.
 
-**For `teleport-db-service`:**
+### Custom role for the Teleport Database Service
 
-* `alloydb.clusters.generateClientCertificate`
-* `alloydb.instances.connect`
-* `iam.serviceAccounts.getAccessToken` (replaces the broader "Service Account Token Creator" role)
+The Teleport Database Service, running as the `teleport-db-service` service account, needs permissions to access the AlloyDB instance.
 
-**For `alloydb-user`:**
+Create a custom role with the following permissions:
 
-* `alloydb.instances.connect`
-* `alloydb.users.login`
-* `serviceusage.services.use`
+```ini
+# Used to generate client certificate
+alloydb.clusters.generateClientCertificate
+# Used to fetch connection information
+alloydb.instances.connect
+```
+
+For impersonating the `alloydb-user` service account, the built-in "Service Account Token Creator" IAM role
+is broader than necessary. To restrict permissions for that service account, create a custom role 
+that includes only:
+
+```ini
+iam.serviceAccounts.getAccessToken
+```
+
+### Custom role for the database user
+
+The `alloydb-user` service account used for database access requires permissions to connect 
+to the instance and authenticate as a database user. Create a custom role with:
+
+```ini
+alloydb.instances.connect
+alloydb.users.login
+serviceusage.services.use
+```
 
 ## Troubleshooting
 
