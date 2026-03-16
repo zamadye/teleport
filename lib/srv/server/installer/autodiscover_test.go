@@ -37,6 +37,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/gravitational/teleport/lib/backend"
 	"github.com/gravitational/teleport/lib/client/debug"
 	"github.com/gravitational/teleport/lib/cloud/imds"
 	"github.com/gravitational/teleport/lib/cloud/imds/azure"
@@ -1333,19 +1334,9 @@ func TestCheckJoinHealth(t *testing.T) {
 			wantErr:         true,
 			wantErrContains: "Teleport agent failed to join the cluster: bad token",
 		},
-		{
-			name:            "long status is truncated in error message",
-			serveReadyz:     true,
-			statusCode:      http.StatusBadRequest,
-			body:            fmt.Sprintf(`{"status":%q,"pid":1}`, strings.Repeat("x", 1000)),
-			systemctlOutput: "active",
-			wantErr:         true,
-			wantErrContains: "(truncated)",
-		},
 	}
 
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
@@ -1541,6 +1532,102 @@ func newTestJoinHealthInstaller(tmpDir string) *AutoDiscoverNodeInstaller {
 func writeMockScript(t *testing.T, dir, name, output string) string {
 	t.Helper()
 	return writeMockScriptWithOutputs(t, dir, name, output, "")
+}
+
+func TestAppendJournal(t *testing.T) {
+	ctx := context.Background()
+	originalErr := trace.Errorf("service teleport is not active (state: inactive)")
+
+	tests := []struct {
+		name            string
+		journalOutput   string
+		wantContains    string
+		wantNotContains string
+		wantOriginal    bool
+	}{
+		{
+			name:          "empty journal returns original error",
+			journalOutput: "",
+			wantOriginal:  true,
+		},
+		{
+			name:          "ERRO lines are appended to error",
+			journalOutput: "2024-01-01 ERRO Failed to join cluster",
+			wantContains:  "Journal output:\n2024-01-01 ERRO Failed to join cluster",
+		},
+		{
+			name:          "WARN lines are appended to error",
+			journalOutput: "2024-01-01 WARN Token expired",
+			wantContains:  "Journal output:\n2024-01-01 WARN Token expired",
+		},
+		{
+			name:          "non-teleport lines are kept",
+			journalOutput: "systemd[1]: teleport.service: Main process exited, code=exited",
+			wantContains:  "Journal output:\nsystemd[1]: teleport.service: Main process exited",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mockDir := t.TempDir()
+			journalctlPath := writeMockScript(t, mockDir, "journalctl", tt.journalOutput)
+
+			installer := &AutoDiscoverNodeInstaller{
+				AutoDiscoverNodeInstallerConfig: &AutoDiscoverNodeInstallerConfig{
+					Logger: slog.Default(),
+					binariesLocation: packagemanager.BinariesLocation{
+						Journalctl: journalctlPath,
+					},
+				},
+			}
+
+			got := installer.appendJournal(ctx, "teleport", originalErr)
+
+			if tt.wantOriginal {
+				require.Equal(t, originalErr.Error(), got.Error(),
+					"expected original error to be returned unchanged")
+				return
+			}
+			if tt.wantContains != "" {
+				require.Contains(t, got.Error(), tt.wantContains)
+			}
+			if tt.wantNotContains != "" {
+				require.NotContains(t, got.Error(), tt.wantNotContains)
+			}
+			// The original error message must always be present.
+			require.Contains(t, got.Error(), originalErr.Error())
+		})
+	}
+}
+
+func TestRedactFlagArgsForTeleportNodeConfigure(t *testing.T) {
+	t.Parallel()
+
+	original := []string{
+		"node",
+		"configure",
+		"--proxy=example.teleport.sh:443",
+		"--token=my-secret-token",
+		"--labels=teleport.dev/instance-id=i-123",
+	}
+
+	redacted := utils.RedactFlagArgs(original, teleportNodeConfigureArgRedactors)
+	maskedToken := "--token=" + backend.MaskKeyName("my-secret-token")
+
+	require.Equal(t, []string{
+		"node",
+		"configure",
+		"--proxy=example.teleport.sh:443",
+		maskedToken,
+		"--labels=teleport.dev/instance-id=i-123",
+	}, redacted)
+	require.Equal(t, []string{
+		"node",
+		"configure",
+		"--proxy=example.teleport.sh:443",
+		"--token=my-secret-token",
+		"--labels=teleport.dev/instance-id=i-123",
+	}, original)
 }
 
 // writeMockScriptWithOutputs creates a tiny shell script that prints output to stdout/stderr

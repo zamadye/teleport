@@ -44,6 +44,7 @@ import (
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/automaticupgrades/constants"
 	"github.com/gravitational/teleport/lib/automaticupgrades/version"
+	"github.com/gravitational/teleport/lib/backend"
 	"github.com/gravitational/teleport/lib/client/debug"
 	"github.com/gravitational/teleport/lib/cloud"
 	"github.com/gravitational/teleport/lib/cloud/gcp"
@@ -73,27 +74,16 @@ const (
 	// readyzStatusStartingKeyword marks a transient startup status in readyz.
 	readyzStatusStartingKeyword = "starting"
 
-	// maxReadyzStatusLen is the maximum number of runes to include from the readyz
-	// status message in error output and audit events.
-	maxReadyzStatusLen = 512
-
-	// readyzStatusTruncatedSuffix marks that the readyz status string was truncated to maxReadyzStatusLen.
-	readyzStatusTruncatedSuffix = "... (truncated)"
-
-	// maxJournalLines limits how many recent journalctl lines we capture before any
-	// filtering/truncation, to keep collection bounded.
+	// maxJournalLines is the number of recent journalctl lines to capture.
 	maxJournalLines = 50
-
-	// maxJournalOutputLen limits the size of journal output text embedded into wrapped
-	// errors and audit-facing stderr payloads after capture/filtering.
-	maxJournalOutputLen = 4096
-
-	// journalOutputTruncatedSuffix marks that embedded journal output text was truncated to maxJournalOutputLen.
-	journalOutputTruncatedSuffix = "... (truncated)"
 )
 
 // ErrJoinFailure is returned when the Teleport agent is installed but fails to join the cluster.
 var ErrJoinFailure = errors.New("join failure")
+
+var teleportNodeConfigureArgRedactors = map[string]utils.ArgValueRedactor{
+	"--token": backend.MaskKeyName,
+}
 
 const (
 	discoverNotice = "" +
@@ -572,12 +562,12 @@ func (a *AutoDiscoverNodeInstaller) checkReadyz(ctx context.Context) (reachable,
 		return true, false, nil
 	}
 
-	status := utils.TruncateRunesWithSuffix(readiness.Status, maxReadyzStatusLen, readyzStatusTruncatedSuffix)
+	status := readiness.Status
 
 	// "starting" is transient — the process is up but hasn't joined yet.
 	// Signal the caller to retry after a delay instead of treating this as
 	// a definitive failure.
-	if strings.Contains(readiness.Status, readyzStatusStartingKeyword) {
+	if strings.Contains(status, readyzStatusStartingKeyword) {
 		a.Logger.InfoContext(ctx, "Teleport agent is still starting", "status", status)
 		return true, true, nil
 	}
@@ -597,12 +587,9 @@ func isConnectionError(err error) bool {
 // If no output is available, the original error is returned unchanged.
 func (a *AutoDiscoverNodeInstaller) appendJournal(ctx context.Context, serviceName string, err error) error {
 	journalOutput := a.captureJournal(ctx, serviceName)
-	journalOutput = filterJournalErrors(journalOutput)
 	if journalOutput == "" {
 		return err
 	}
-	journalOutput = utils.TruncateRunesWithSuffix(journalOutput, maxJournalOutputLen, journalOutputTruncatedSuffix)
-
 	return trace.Wrap(err, "\n\nJournal output:\n%s", journalOutput)
 }
 
@@ -634,54 +621,6 @@ func (a *AutoDiscoverNodeInstaller) captureJournal(ctx context.Context, serviceN
 	}
 
 	return strings.TrimSpace(stdoutBuf.String())
-}
-
-// filterJournalErrors filters journal output to reduce noise while preserving
-// useful diagnostics. Teleport INFO lines are dropped (startup/retry noise),
-// but ERRO/WARN lines are kept and deduplicated. Non-Teleport lines (systemd,
-// kernel, AppArmor) are always kept, since they may be the only evidence when
-// Teleport crashes before logging initializes.
-func filterJournalErrors(output string) string {
-	var filtered []string
-	var lastDedupKey string
-
-	for _, line := range strings.Split(output, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-
-		isTeleportLog := strings.Contains(line, "ERRO") || strings.Contains(line, "WARN") || strings.Contains(line, "INFO")
-		if isTeleportLog && !strings.Contains(line, "ERRO") && !strings.Contains(line, "WARN") {
-			// Teleport INFO line — skip.
-			continue
-		}
-
-		// For Teleport ERRO/WARN lines, deduplicate by stripping variable parts
-		// (timestamps, component tags like "[PROC:1]", trailing "pid:NNN.N file.go:line").
-		if strings.Contains(line, "ERRO") || strings.Contains(line, "WARN") {
-			dedupKey := line
-			if idx := strings.Index(dedupKey, "ERRO"); idx >= 0 {
-				dedupKey = dedupKey[idx:]
-			} else if idx := strings.Index(dedupKey, "WARN"); idx >= 0 {
-				dedupKey = dedupKey[idx:]
-			}
-			if start := strings.Index(dedupKey, "]"); start >= 0 {
-				dedupKey = dedupKey[:5] + dedupKey[start+1:]
-			}
-			if idx := strings.LastIndex(dedupKey, " pid:"); idx >= 0 {
-				dedupKey = dedupKey[:idx]
-			}
-			if dedupKey == lastDedupKey {
-				continue
-			}
-			lastDedupKey = dedupKey
-		}
-
-		filtered = append(filtered, line)
-	}
-
-	return strings.TrimSpace(strings.Join(filtered, "\n"))
 }
 
 // enableAndRestartTeleportService will enable and (re)start the teleport.service.
@@ -747,7 +686,11 @@ func (ani *AutoDiscoverNodeInstaller) configureTeleportNode(ctx context.Context,
 			fmt.Sprintf(`--azure-client-id=%s`, shsprintf.EscapeDefaultContext(ani.AzureClientID)))
 	}
 
-	ani.Logger.InfoContext(ctx, "Generating teleport configuration", "teleport", ani.binariesLocation.Teleport, "args", teleportNodeConfigureArgs)
+	ani.Logger.InfoContext(ctx,
+		"Generating teleport configuration",
+		"teleport", ani.binariesLocation.Teleport,
+		"args", utils.RedactFlagArgs(teleportNodeConfigureArgs, teleportNodeConfigureArgRedactors),
+	)
 	teleportNodeConfigureCmd := exec.CommandContext(ctx, ani.binariesLocation.Teleport, teleportNodeConfigureArgs...)
 	teleportNodeConfigureCmdOutput, err := teleportNodeConfigureCmd.CombinedOutput()
 	if err != nil {
