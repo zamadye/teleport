@@ -218,7 +218,7 @@ func TestHandleReadiness(t *testing.T) {
 			wantStatus: "teleport is starting and hasn't joined the cluster yet",
 		},
 		{
-			name: "join error status override",
+			name:   "join error status override",
 			states: map[string]*componentState{},
 			joinErrorGetter: func() string {
 				return "instance failed to join cluster: auth unavailable"
@@ -228,7 +228,7 @@ func TestHandleReadiness(t *testing.T) {
 			wantStatus: "instance failed to join cluster: auth unavailable",
 		},
 		{
-			name: "default status when join error is empty",
+			name:   "default status when join error is empty",
 			states: map[string]*componentState{},
 			joinErrorGetter: func() string {
 				return ""
