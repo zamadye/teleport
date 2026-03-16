@@ -27,7 +27,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"slices"
 	"testing"
 
@@ -282,11 +281,7 @@ func TestWriteInstallJoinFailureError(t *testing.T) {
 		var stderr bytes.Buffer
 		writeInstallJoinFailureError(&stderr, errors.New("plain failure"))
 
-		if runtime.GOOS == "windows" {
-			require.Equal(t, "ERROR: plain failure\n\n", stderr.String())
-		} else {
-			require.Equal(t, "\x1b[31mERROR: \x1b[0mplain failure\n\n", stderr.String())
-		}
+		require.Equal(t, "ERROR: plain failure\n", stderr.String())
 		require.NotContains(t, stderr.String(), "join failure")
 	})
 
@@ -296,11 +291,7 @@ func TestWriteInstallJoinFailureError(t *testing.T) {
 		var stderr bytes.Buffer
 		writeInstallJoinFailureError(&stderr, &trace.TraceErr{Err: errors.New("join failure")})
 
-		if runtime.GOOS == "windows" {
-			require.Equal(t, "ERROR: join failure\n\n", stderr.String())
-		} else {
-			require.Equal(t, "\x1b[31mERROR: \x1b[0mjoin failure\n\n", stderr.String())
-		}
+		require.Equal(t, "ERROR: join failure\n", stderr.String())
 		require.Contains(t, stderr.String(), "join failure")
 	})
 }

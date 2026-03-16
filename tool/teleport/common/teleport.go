@@ -905,7 +905,7 @@ func writeInstallJoinFailureError(w io.Writer, err error) {
 		return
 	}
 
-	fmt.Fprintln(w, utils.UserMessageFromError(err))
+	fmt.Fprintf(w, "ERROR: %s\n", err.Error())
 }
 
 // OnStart is the handler for "start" CLI command
