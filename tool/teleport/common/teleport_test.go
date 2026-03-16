@@ -21,11 +21,13 @@ package common
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"testing"
 
@@ -256,6 +258,51 @@ func TestDumpConfigFile(t *testing.T) {
 			tc.assert(t, err)
 		})
 	}
+}
+
+func TestWriteInstallJoinFailureError(t *testing.T) {
+	t.Parallel()
+
+	t.Run("trace messages are printed without sentinel join failure", func(t *testing.T) {
+		t.Parallel()
+
+		var stderr bytes.Buffer
+		writeInstallJoinFailureError(&stderr, &trace.TraceErr{
+			Err:      errors.New("join failure"),
+			Messages: []string{"failed to join cluster", "journal line 1\njournal line 2"},
+		})
+
+		require.Equal(t, "ERROR: failed to join cluster\njournal line 1\njournal line 2\n", stderr.String())
+		require.NotContains(t, stderr.String(), "join failure")
+	})
+
+	t.Run("falls back to user message for plain errors", func(t *testing.T) {
+		t.Parallel()
+
+		var stderr bytes.Buffer
+		writeInstallJoinFailureError(&stderr, errors.New("plain failure"))
+
+		if runtime.GOOS == "windows" {
+			require.Equal(t, "ERROR: plain failure\n\n", stderr.String())
+		} else {
+			require.Equal(t, "\x1b[31mERROR: \x1b[0mplain failure\n\n", stderr.String())
+		}
+		require.NotContains(t, stderr.String(), "join failure")
+	})
+
+	t.Run("falls back to user message when trace messages are empty", func(t *testing.T) {
+		t.Parallel()
+
+		var stderr bytes.Buffer
+		writeInstallJoinFailureError(&stderr, &trace.TraceErr{Err: errors.New("join failure")})
+
+		if runtime.GOOS == "windows" {
+			require.Equal(t, "ERROR: join failure\n\n", stderr.String())
+		} else {
+			require.Equal(t, "\x1b[31mERROR: \x1b[0mjoin failure\n\n", stderr.String())
+		}
+		require.Contains(t, stderr.String(), "join failure")
+	})
 }
 
 const configData = `
