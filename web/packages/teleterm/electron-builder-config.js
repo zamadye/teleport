@@ -182,6 +182,8 @@ module.exports = {
   win: {
     target: ['nsis'],
     signtoolOptions: {
+      publisherName:
+        'CN="Gravitational, Inc.", O="Gravitational, Inc.", L=Oakland, S=California, C=US',
       // The algorithm passed here is not used, it only prevents the signing function from being called twice for each file.
       // https://github.com/electron-userland/electron-builder/issues/3995#issuecomment-505725704
       signingHashAlgorithms: ['sha256'],
