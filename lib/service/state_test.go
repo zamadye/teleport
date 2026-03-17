@@ -23,7 +23,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -185,12 +184,11 @@ func TestHandleReadiness(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name            string
-		states          map[string]*componentState
-		joinErrorGetter func() string
-		wantCode        int
-		wantReady       bool
-		wantStatus      string
+		name       string
+		states     map[string]*componentState
+		wantCode   int
+		wantReady  bool
+		wantStatus string
 	}{
 		{
 			name: "degraded",
@@ -211,28 +209,8 @@ func TestHandleReadiness(t *testing.T) {
 			wantStatus: "teleport is recovering from a degraded state, check logs for details",
 		},
 		{
-			name:       "default status when join error getter is nil",
+			name:       "starting",
 			states:     map[string]*componentState{},
-			wantCode:   http.StatusBadRequest,
-			wantReady:  false,
-			wantStatus: "teleport is starting and hasn't joined the cluster yet",
-		},
-		{
-			name:   "join error status override",
-			states: map[string]*componentState{},
-			joinErrorGetter: func() string {
-				return "instance failed to join cluster: auth unavailable"
-			},
-			wantCode:   http.StatusBadRequest,
-			wantReady:  false,
-			wantStatus: "instance failed to join cluster: auth unavailable",
-		},
-		{
-			name:   "default status when join error is empty",
-			states: map[string]*componentState{},
-			joinErrorGetter: func() string {
-				return ""
-			},
 			wantCode:   http.StatusBadRequest,
 			wantReady:  false,
 			wantStatus: "teleport is starting and hasn't joined the cluster yet",
@@ -253,10 +231,7 @@ func TestHandleReadiness(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			ps := &processState{
-				states:          tt.states,
-				joinErrorGetter: tt.joinErrorGetter,
-			}
+			ps := &processState{states: tt.states}
 
 			w := httptest.NewRecorder()
 			ps.handleReadiness(w, httptest.NewRequest(http.MethodGet, "/readyz", nil))
@@ -268,64 +243,6 @@ func TestHandleReadiness(t *testing.T) {
 			require.Equal(t, tt.wantReady, readiness.Ready)
 			require.Equal(t, os.Getpid(), readiness.PID)
 			require.Equal(t, tt.wantStatus, readiness.Status)
-		})
-	}
-}
-
-func TestHandleReadinessJoinErrorGetterCalledOnlyForStarting(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name      string
-		states    map[string]*componentState
-		wantCalls int32
-	}{
-		{
-			name: "degraded does not query join error",
-			states: map[string]*componentState{
-				"component": {state: stateDegraded},
-			},
-			wantCalls: 0,
-		},
-		{
-			name: "recovering does not query join error",
-			states: map[string]*componentState{
-				"component": {state: stateRecovering},
-			},
-			wantCalls: 0,
-		},
-		{
-			name: "ok does not query join error",
-			states: map[string]*componentState{
-				"component": {state: stateOK},
-			},
-			wantCalls: 0,
-		},
-		{
-			name:      "starting queries join error once",
-			states:    map[string]*componentState{},
-			wantCalls: 1,
-		},
-	}
-
-	for _, tt := range tests {
-		tt := tt
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			var calls atomic.Int32
-			ps := &processState{
-				states: tt.states,
-				joinErrorGetter: func() string {
-					calls.Add(1)
-					return "join failed"
-				},
-			}
-
-			w := httptest.NewRecorder()
-			ps.handleReadiness(w, httptest.NewRequest(http.MethodGet, "/readyz", nil))
-
-			require.Equal(t, tt.wantCalls, calls.Load())
 		})
 	}
 }
