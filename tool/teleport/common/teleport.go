@@ -900,12 +900,32 @@ Examples:
 func writeInstallJoinFailureError(w io.Writer, err error) {
 	var traceErr *trace.TraceErr
 	if errors.As(err, &traceErr) && len(traceErr.Messages) > 0 {
-		msg := strings.Join(traceErr.Messages, "\n")
+		messages := slices.DeleteFunc(slices.Clone(traceErr.Messages), func(m string) bool {
+			return len(traceErr.Messages) > 1 && strings.TrimSpace(m) == installer.ErrJoinFailure.Error()
+		})
+		msg := stripStandaloneJoinFailureLines(strings.Join(messages, "\n"))
 		fmt.Fprintf(w, "ERROR: %s\n", utils.AllowWhitespace(msg))
 		return
 	}
 
 	fmt.Fprintf(w, "ERROR: %s\n", err.Error())
+}
+
+func stripStandaloneJoinFailureLines(msg string) string {
+	lines := strings.Split(msg, "\n")
+	filtered := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if strings.TrimSpace(line) == installer.ErrJoinFailure.Error() {
+			continue
+		}
+		filtered = append(filtered, line)
+	}
+
+	if len(filtered) == 0 {
+		return msg
+	}
+
+	return strings.Trim(strings.Join(filtered, "\n"), "\n")
 }
 
 // OnStart is the handler for "start" CLI command

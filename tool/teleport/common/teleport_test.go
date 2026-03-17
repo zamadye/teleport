@@ -275,6 +275,30 @@ func TestWriteInstallJoinFailureError(t *testing.T) {
 		require.NotContains(t, stderr.String(), "join failure")
 	})
 
+	t.Run("trace messages filter standalone sentinel line", func(t *testing.T) {
+		t.Parallel()
+
+		var stderr bytes.Buffer
+		writeInstallJoinFailureError(&stderr, &trace.TraceErr{
+			Err:      errors.New("join failure"),
+			Messages: []string{"token is expired", "\tjoin failure"},
+		})
+
+		require.Equal(t, "ERROR: token is expired\n", stderr.String())
+	})
+
+	t.Run("trace messages filter standalone sentinel line embedded in message text", func(t *testing.T) {
+		t.Parallel()
+
+		var stderr bytes.Buffer
+		writeInstallJoinFailureError(&stderr, &trace.TraceErr{
+			Err:      errors.New("join failure"),
+			Messages: []string{"token is expired\n\tjoin failure\nmore detail"},
+		})
+
+		require.Equal(t, "ERROR: token is expired\nmore detail\n", stderr.String())
+	})
+
 	t.Run("falls back to user message for plain errors", func(t *testing.T) {
 		t.Parallel()
 
