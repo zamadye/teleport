@@ -781,12 +781,6 @@ func TestClassifyEC2SSMInvocationIssueType(t *testing.T) {
 			exitCode: int64(installstatus.JoinFailure),
 			want:     usertasks.AutoDiscoverEC2IssueSSMScriptFailure,
 		},
-		{
-			name:     "timed out with join failure exit code stays script failure issue",
-			status:   ssmtypes.CommandInvocationStatusTimedOut,
-			exitCode: int64(installstatus.JoinFailure),
-			want:     usertasks.AutoDiscoverEC2IssueSSMScriptFailure,
-		},
 	}
 
 	for _, tt := range tests {

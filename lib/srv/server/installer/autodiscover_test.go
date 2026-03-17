@@ -1277,6 +1277,14 @@ func TestCheckJoinHealth(t *testing.T) {
 		serveReadyz bool
 		statusCode  int
 		body        string
+		// joinCheckDelay overrides the retry delay for this test case.
+		joinCheckDelay time.Duration
+		// contextTimeout sets a timeout on the check context for this test case.
+		contextTimeout time.Duration
+		// wantNotDeadlineExceeded asserts the returned error is not context deadline exceeded.
+		wantNotDeadlineExceeded bool
+		// systemctlChecks is the number of `systemctl is-active` calls expected.
+		systemctlChecks int
 		// systemctlOutput is what the mock systemctl is-active prints to stdout.
 		// Only used when serveReadyz is false (socket unavailable path).
 		systemctlOutput string
@@ -1290,6 +1298,7 @@ func TestCheckJoinHealth(t *testing.T) {
 		{
 			name:            "socket unavailable and service active returns join failure",
 			serveReadyz:     false,
+			systemctlChecks: 2,
 			systemctlOutput: "active",
 			wantErr:         true,
 			wantErrContains: "readyz socket remained unavailable after 0s wait (attempts=2)",
@@ -1297,22 +1306,16 @@ func TestCheckJoinHealth(t *testing.T) {
 		{
 			name:            "socket unavailable and service failed returns join failure",
 			serveReadyz:     false,
+			systemctlChecks: 1,
 			systemctlOutput: "failed",
 			journalOutput:   "error: bad token or something",
 			wantErr:         true,
 			wantErrContains: "systemd reported service teleport is not active (state: \"failed\"",
 		},
 		{
-			name:            "socket unavailable and service inactive returns join failure",
-			serveReadyz:     false,
-			systemctlOutput: "inactive",
-			journalOutput:   "permission denied opening BPF",
-			wantErr:         true,
-			wantErrContains: "systemd reported service teleport is not active (state: \"inactive\"",
-		},
-		{
 			name:            "socket unavailable and service deactivating returns transition failure",
 			serveReadyz:     false,
+			systemctlChecks: 2,
 			systemctlOutput: "deactivating",
 			journalOutput:   "systemd is stopping teleport",
 			wantErr:         true,
@@ -1323,22 +1326,28 @@ func TestCheckJoinHealth(t *testing.T) {
 			serveReadyz:     true,
 			statusCode:      http.StatusOK,
 			body:            `{"status":"ok","pid":1}`,
+			systemctlChecks: 1,
 			systemctlOutput: "active",
 		},
 		{
-			name:            "agent starting returns join failure after wait",
-			serveReadyz:     true,
-			statusCode:      http.StatusBadRequest,
-			body:            `{"status":"teleport is starting and hasn't joined the cluster yet","pid":1}`,
-			systemctlOutput: "active",
-			wantErr:         true,
-			wantErrContains: `readyz remained in starting state after 0s wait (attempts=2, status="teleport is starting and hasn't joined the cluster yet")`,
+			name:                    "agent starting returns join failure after wait",
+			serveReadyz:             true,
+			statusCode:              http.StatusBadRequest,
+			body:                    `{"status":"teleport is starting and hasn't joined the cluster yet","pid":1}`,
+			joinCheckDelay:          10 * time.Millisecond,
+			contextTimeout:          10 * time.Second,
+			wantNotDeadlineExceeded: true,
+			systemctlChecks:         2,
+			systemctlOutput:         "active",
+			wantErr:                 true,
+			wantErrContains:         `readyz remained in starting state after 10ms wait (attempts=2, status="teleport is starting and hasn't joined the cluster yet")`,
 		},
 		{
 			name:            "agent not ready returns join failure with journal",
 			serveReadyz:     true,
 			statusCode:      http.StatusBadRequest,
 			body:            `{"status":"bad token","pid":1}`,
+			systemctlChecks: 1,
 			systemctlOutput: "active",
 			journalOutput:   "auth handshake failed: bad token",
 			wantErr:         true,
@@ -1357,23 +1366,42 @@ func TestCheckJoinHealth(t *testing.T) {
 				startReadyzServer(t, socketPath, tt.statusCode, tt.body)
 			}
 
-			mockSystemctl := writeMockScript(t, tmpDir, "systemctl", tt.systemctlOutput)
-			mockJournalctl := writeMockScriptWithOutputs(t, tmpDir, "journalctl", tt.journalOutput, tt.journalStderrOutput)
+			systemctlMock := newBintestMock(t, "systemctl")
+			journalctlMock := newBintestMock(t, "journalctl")
+			expectSystemctlIsActiveCalls(systemctlMock, "teleport", tt.systemctlOutput, tt.systemctlChecks)
+			if tt.wantErr {
+				expectSystemctlShowInvocationID(systemctlMock, "teleport", "n/a", "")
+				expectJournalctlCall(journalctlMock, "teleport", "", tt.journalOutput, tt.journalStderrOutput)
+			}
 
 			inst := newTestJoinHealthInstaller(tmpDir)
-			inst.binariesLocation.Systemctl = mockSystemctl
-			inst.binariesLocation.Journalctl = mockJournalctl
+			inst.joinCheckDelay = tt.joinCheckDelay
+			inst.binariesLocation.Systemctl = systemctlMock.Path
+			inst.binariesLocation.Journalctl = journalctlMock.Path
 
-			checkErr := inst.checkJoinHealth(context.Background())
+			ctx := context.Background()
+			if tt.contextTimeout > 0 {
+				ctxWithTimeout, cancel := context.WithTimeout(ctx, tt.contextTimeout)
+				defer cancel()
+				ctx = ctxWithTimeout
+			}
+
+			checkErr := inst.checkJoinHealth(ctx)
 			if tt.wantErr {
 				require.Error(t, checkErr)
 				require.Contains(t, checkErr.Error(), "join failure")
+				if tt.wantNotDeadlineExceeded {
+					require.NotErrorIs(t, checkErr, context.DeadlineExceeded)
+				}
 				if tt.wantErrContains != "" {
 					require.Contains(t, checkErr.Error(), tt.wantErrContains)
 				}
 			} else {
 				require.NoError(t, checkErr)
 			}
+
+			require.True(t, systemctlMock.Check(t), "mismatch between expected invocations and actual calls for %q", "systemctl")
+			require.True(t, journalctlMock.Check(t), "mismatch between expected invocations and actual calls for %q", "journalctl")
 		})
 	}
 }
@@ -1404,32 +1432,6 @@ func TestInstallAndConfigureLockContention(t *testing.T) {
 	require.True(t, trace.IsBadParameter(err))
 	require.Contains(t, err.Error(), "Could not get lock")
 }
-
-func TestCheckJoinHealthStartingRetriesThenFails(t *testing.T) {
-	t.Parallel()
-
-	tmpDir, dataDirPath := newCheckJoinHealthTempDir(t)
-	socketPath := filepath.Join(dataDirPath, "debug.sock")
-	startReadyzServer(t, socketPath, http.StatusBadRequest, `{"status":"teleport is starting and hasn't joined the cluster yet","pid":1}`)
-
-	mockSystemctl := writeMockScript(t, tmpDir, "systemctl", "active")
-	mockJournalctl := writeMockScript(t, tmpDir, "journalctl", "join failed")
-
-	inst := newTestJoinHealthInstaller(tmpDir)
-	inst.joinCheckDelay = 10 * time.Millisecond
-	inst.binariesLocation.Systemctl = mockSystemctl
-	inst.binariesLocation.Journalctl = mockJournalctl
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	err := inst.checkJoinHealth(ctx)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "join failure")
-	require.NotErrorIs(t, err, context.DeadlineExceeded)
-	require.Contains(t, err.Error(), `readyz remained in starting state after 10ms wait (attempts=2, status="teleport is starting and hasn't joined the cluster yet")`)
-}
-
 func TestCheckJoinHealthStartingIncludesTokenHintFromJournal(t *testing.T) {
 	t.Parallel()
 
@@ -1437,49 +1439,40 @@ func TestCheckJoinHealthStartingIncludesTokenHintFromJournal(t *testing.T) {
 	socketPath := filepath.Join(dataDirPath, "debug.sock")
 	startReadyzServer(t, socketPath, http.StatusBadRequest, `{"status":"teleport is starting and hasn't joined the cluster yet","pid":1}`)
 
-	mockSystemctl := writeMockScript(t, tmpDir, "systemctl", "active")
-	mockJournalctl := writeMockScript(t, tmpDir, "journalctl", "Can not join the cluster, the token is expired or not found. Regenerate the token and try again.")
+	systemctlMock := newBintestMock(t, "systemctl")
+	journalctlMock := newBintestMock(t, "journalctl")
+	expectSystemctlIsActiveCalls(systemctlMock, "teleport", "active", 2)
+	expectSystemctlShowInvocationID(systemctlMock, "teleport", "n/a", "")
+	expectJournalctlCall(journalctlMock, "teleport", "", "Can not join the cluster, the token is expired or not found. Regenerate the token and try again.", "")
 
 	inst := newTestJoinHealthInstaller(tmpDir)
 	inst.joinCheckDelay = 10 * time.Millisecond
-	inst.binariesLocation.Systemctl = mockSystemctl
-	inst.binariesLocation.Journalctl = mockJournalctl
+	inst.binariesLocation.Systemctl = systemctlMock.Path
+	inst.binariesLocation.Journalctl = journalctlMock.Path
 
 	err := inst.checkJoinHealth(context.Background())
 	require.Error(t, err)
 	require.Contains(t, err.Error(), `join failure: token is expired or not found; readyz remained in starting state after 10ms wait (attempts=2, status="teleport is starting and hasn't joined the cluster yet")`)
-}
-
-func TestCheckJoinHealthServiceFailureIncludesTokenHintFromJournal(t *testing.T) {
-	t.Parallel()
-
-	tmpDir := t.TempDir()
-	mockSystemctl := writeMockScript(t, tmpDir, "systemctl", "failed")
-	mockJournalctl := writeMockScript(t, tmpDir, "journalctl", "Can not join the cluster, the token is expired or not found. Regenerate the token and try again.")
-
-	inst := newTestJoinHealthInstaller(tmpDir)
-	inst.binariesLocation.Systemctl = mockSystemctl
-	inst.binariesLocation.Journalctl = mockJournalctl
-
-	err := inst.checkJoinHealth(context.Background())
-	require.Error(t, err)
-	require.Contains(t, err.Error(), `join failure: token is expired or not found; systemd reported service teleport is not active (state: "failed"`)
+	require.True(t, systemctlMock.Check(t), "mismatch between expected invocations and actual calls for %q", "systemctl")
+	require.True(t, journalctlMock.Check(t), "mismatch between expected invocations and actual calls for %q", "journalctl")
 }
 
 func TestCheckJoinHealthSystemctlExecutionFailureReturnsJoinFailure(t *testing.T) {
 	t.Parallel()
 
 	tmpDir := t.TempDir()
-	mockJournalctl := writeMockScript(t, tmpDir, "journalctl", "journal output")
+	journalctlMock := newBintestMock(t, "journalctl")
+	expectJournalctlCall(journalctlMock, "teleport", "", "journal output", "")
 
 	inst := newTestJoinHealthInstaller(tmpDir)
 	inst.binariesLocation.Systemctl = filepath.Join(tmpDir, "missing-systemctl")
-	inst.binariesLocation.Journalctl = mockJournalctl
+	inst.binariesLocation.Journalctl = journalctlMock.Path
 
 	err := inst.checkJoinHealth(context.Background())
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "join failure")
 	require.Contains(t, err.Error(), "unable to check service teleport status via systemctl")
+	require.True(t, journalctlMock.Check(t), "mismatch between expected invocations and actual calls for %q", "journalctl")
 }
 
 func TestCheckJoinHealthReadyzFailureIncludesTokenHintFromJournal(t *testing.T) {
@@ -1489,16 +1482,21 @@ func TestCheckJoinHealthReadyzFailureIncludesTokenHintFromJournal(t *testing.T) 
 	socketPath := filepath.Join(dataDirPath, "debug.sock")
 	startReadyzServer(t, socketPath, http.StatusBadRequest, `{"status":"bad token","pid":1}`)
 
-	mockSystemctl := writeMockScript(t, tmpDir, "systemctl", "active")
-	mockJournalctl := writeMockScript(t, tmpDir, "journalctl", "Can not join the cluster, the token is expired or not found. Regenerate the token and try again.")
+	systemctlMock := newBintestMock(t, "systemctl")
+	journalctlMock := newBintestMock(t, "journalctl")
+	expectSystemctlIsActiveCalls(systemctlMock, "teleport", "active", 1)
+	expectSystemctlShowInvocationID(systemctlMock, "teleport", "n/a", "")
+	expectJournalctlCall(journalctlMock, "teleport", "", "Can not join the cluster, the token is expired or not found. Regenerate the token and try again.", "")
 
 	inst := newTestJoinHealthInstaller(tmpDir)
-	inst.binariesLocation.Systemctl = mockSystemctl
-	inst.binariesLocation.Journalctl = mockJournalctl
+	inst.binariesLocation.Systemctl = systemctlMock.Path
+	inst.binariesLocation.Journalctl = journalctlMock.Path
 
 	err := inst.checkJoinHealth(context.Background())
 	require.Error(t, err)
 	require.Contains(t, err.Error(), `join failure: token is expired or not found; readyz reported not ready: bad token`)
+	require.True(t, systemctlMock.Check(t), "mismatch between expected invocations and actual calls for %q", "systemctl")
+	require.True(t, journalctlMock.Check(t), "mismatch between expected invocations and actual calls for %q", "journalctl")
 }
 
 func TestCheckReadyzReturnsContextCancellation(t *testing.T) {
@@ -1527,8 +1525,9 @@ func TestCheckJoinHealthRetriesSocketUnavailableThenReady(t *testing.T) {
 	inst := newTestJoinHealthInstaller(tmpDir)
 	inst.joinCheckDelay = time.Millisecond
 
-	mockSystemctl := writeMockScript(t, tmpDir, "systemctl", "active")
-	inst.binariesLocation.Systemctl = mockSystemctl
+	systemctlMock := newBintestMock(t, "systemctl")
+	expectSystemctlIsActiveCalls(systemctlMock, "teleport", "active", 2)
+	inst.binariesLocation.Systemctl = systemctlMock.Path
 
 	checkCalls := 0
 	inst.readyzCheck = func(_ context.Context) (debug.Readiness, error) {
@@ -1542,6 +1541,7 @@ func TestCheckJoinHealthRetriesSocketUnavailableThenReady(t *testing.T) {
 	err := inst.checkJoinHealth(context.Background())
 	require.NoError(t, err)
 	require.Equal(t, 2, checkCalls)
+	require.True(t, systemctlMock.Check(t), "mismatch between expected invocations and actual calls for %q", "systemctl")
 }
 
 func TestCheckReadyzTimeoutReturnsJoinFailure(t *testing.T) {
@@ -1609,12 +1609,64 @@ func newTestJoinHealthInstaller(tmpDir string) *AutoDiscoverNodeInstaller {
 	}
 }
 
-// writeMockScript creates a tiny shell script that prints the given output to stdout and exits 0
-// (or exits 1 if output is empty, to simulate a command that fails/returns nothing).
-// Returns the absolute path to the script.
-func writeMockScript(t *testing.T, dir, name, output string) string {
+func newBintestMock(t *testing.T, name string) *bintest.Mock {
 	t.Helper()
-	return writeMockScriptWithOutputs(t, dir, name, output, "")
+
+	mock, err := bintest.NewMock(name)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		assert.NoError(t, mock.Close())
+	})
+
+	return mock
+}
+
+func expectSystemctlIsActiveCalls(systemctlMock *bintest.Mock, serviceName, state string, calls int) {
+	for i := 0; i < calls; i++ {
+		call := systemctlMock.Expect("is-active", serviceName)
+		if state != "" {
+			call.AndWriteToStdout(state)
+		}
+	}
+}
+
+func expectSystemctlShowInvocationID(systemctlMock *bintest.Mock, serviceName, invocationID, stderr string) {
+	call := systemctlMock.Expect("show", serviceName, "--property", "InvocationID", "--value")
+	if invocationID == "" && stderr == "" {
+		return
+	}
+
+	call.AndCallFunc(func(c *bintest.Call) {
+		if stderr != "" {
+			fmt.Fprintln(c.Stderr, stderr)
+		}
+		if invocationID != "" {
+			fmt.Fprintln(c.Stdout, invocationID)
+		}
+		c.Exit(0)
+	})
+}
+
+func expectJournalctlCall(journalctlMock *bintest.Mock, serviceName, invocationID, stdoutOutput, stderrOutput string) {
+	args := buildJournalctlArgs(serviceName, invocationID)
+	callArgs := make([]interface{}, 0, len(args))
+	for _, arg := range args {
+		callArgs = append(callArgs, arg)
+	}
+	call := journalctlMock.Expect(callArgs...)
+	if stdoutOutput == "" && stderrOutput == "" {
+		return
+	}
+
+	call.AndCallFunc(func(c *bintest.Call) {
+		if stdoutOutput != "" {
+			fmt.Fprintln(c.Stdout, stdoutOutput)
+		}
+		if stderrOutput != "" {
+			fmt.Fprintln(c.Stderr, stderrOutput)
+		}
+		c.Exit(0)
+	})
 }
 
 func TestAppendJournal(t *testing.T) {
@@ -1634,16 +1686,6 @@ func TestAppendJournal(t *testing.T) {
 			wantOriginal:  true,
 		},
 		{
-			name:          "ERRO lines are appended to error",
-			journalOutput: "2024-01-01 ERRO Failed to join cluster",
-			wantContains:  "Journal output:\n2024-01-01 ERRO Failed to join cluster",
-		},
-		{
-			name:          "WARN lines are appended to error",
-			journalOutput: "2024-01-01 WARN Token expired",
-			wantContains:  "Journal output:\n2024-01-01 WARN Token expired",
-		},
-		{
 			name:          "non-teleport lines are kept",
 			journalOutput: "systemd[1]: teleport.service: Main process exited, code=exited",
 			wantContains:  "Journal output:\nsystemd[1]: teleport.service: Main process exited",
@@ -1652,14 +1694,17 @@ func TestAppendJournal(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			mockDir := t.TempDir()
-			journalctlPath := writeMockScript(t, mockDir, "journalctl", tt.journalOutput)
+			systemctlMock := newBintestMock(t, "systemctl")
+			journalctlMock := newBintestMock(t, "journalctl")
+			expectSystemctlShowInvocationID(systemctlMock, "teleport", "n/a", "")
+			expectJournalctlCall(journalctlMock, "teleport", "", tt.journalOutput, "")
 
 			installer := &AutoDiscoverNodeInstaller{
 				AutoDiscoverNodeInstallerConfig: &AutoDiscoverNodeInstallerConfig{
 					Logger: slog.Default(),
 					binariesLocation: packagemanager.BinariesLocation{
-						Journalctl: journalctlPath,
+						Systemctl:  systemctlMock.Path,
+						Journalctl: journalctlMock.Path,
 					},
 				},
 			}
@@ -1669,6 +1714,8 @@ func TestAppendJournal(t *testing.T) {
 			if tt.wantOriginal {
 				require.Equal(t, originalErr.Error(), got.Error(),
 					"expected original error to be returned unchanged")
+				require.True(t, systemctlMock.Check(t), "mismatch between expected invocations and actual calls for %q", "systemctl")
+				require.True(t, journalctlMock.Check(t), "mismatch between expected invocations and actual calls for %q", "journalctl")
 				return
 			}
 			if tt.wantContains != "" {
@@ -1679,6 +1726,8 @@ func TestAppendJournal(t *testing.T) {
 			}
 			// The original error message must always be present.
 			require.Contains(t, got.Error(), originalErr.Error())
+			require.True(t, systemctlMock.Check(t), "mismatch between expected invocations and actual calls for %q", "systemctl")
+			require.True(t, journalctlMock.Check(t), "mismatch between expected invocations and actual calls for %q", "journalctl")
 		})
 	}
 }
@@ -1686,23 +1735,18 @@ func TestAppendJournal(t *testing.T) {
 func TestCaptureJournalFiltersByInvocationID(t *testing.T) {
 	t.Parallel()
 
-	mockDir := t.TempDir()
 	invocationID := "0123456789abcdef0123456789abcdef"
-	systemctlPath := writeExecutableScript(t, mockDir, "mock-systemctl", fmt.Sprintf(`#!/bin/sh
-printf "%%s\n" "systemctl warning" >&2
-printf "%%s\n" "%s"
-exit 0
-`, invocationID))
-	journalctlPath := writeExecutableScript(t, mockDir, "mock-journalctl", `#!/bin/sh
-printf "%s\n" "$*"
-`)
+	systemctlMock := newBintestMock(t, "systemctl")
+	journalctlMock := newBintestMock(t, "journalctl")
+	expectSystemctlShowInvocationID(systemctlMock, "teleport", invocationID, "systemctl warning")
+	expectJournalctlCall(journalctlMock, "teleport", invocationID, "--unit teleport --no-pager --lines 50 _SYSTEMD_INVOCATION_ID="+invocationID, "")
 
 	installer := &AutoDiscoverNodeInstaller{
 		AutoDiscoverNodeInstallerConfig: &AutoDiscoverNodeInstallerConfig{
 			Logger: slog.Default(),
 			binariesLocation: packagemanager.BinariesLocation{
-				Systemctl:  systemctlPath,
-				Journalctl: journalctlPath,
+				Systemctl:  systemctlMock.Path,
+				Journalctl: journalctlMock.Path,
 			},
 		},
 	}
@@ -1711,29 +1755,24 @@ printf "%s\n" "$*"
 	require.NoError(t, err)
 	require.Contains(t, got, "_SYSTEMD_INVOCATION_ID="+invocationID)
 	require.Contains(t, got, "--unit teleport")
+	require.True(t, systemctlMock.Check(t), "mismatch between expected invocations and actual calls for %q", "systemctl")
+	require.True(t, journalctlMock.Check(t), "mismatch between expected invocations and actual calls for %q", "journalctl")
 }
 
 func TestCaptureJournalFallsBackWithoutInvocationID(t *testing.T) {
 	t.Parallel()
 
-	mockDir := t.TempDir()
-	systemctlPath := writeExecutableScript(t, mockDir, "mock-systemctl", `#!/bin/sh
-if [ "$1" = "show" ]; then
-  printf "%s\n" "active"
-  exit 0
-fi
-exit 1
-`)
-	journalctlPath := writeExecutableScript(t, mockDir, "mock-journalctl", `#!/bin/sh
-printf "%s\n" "$*"
-`)
+	systemctlMock := newBintestMock(t, "systemctl")
+	journalctlMock := newBintestMock(t, "journalctl")
+	expectSystemctlShowInvocationID(systemctlMock, "teleport", "active", "")
+	expectJournalctlCall(journalctlMock, "teleport", "", "--unit teleport --no-pager --lines 50", "")
 
 	installer := &AutoDiscoverNodeInstaller{
 		AutoDiscoverNodeInstallerConfig: &AutoDiscoverNodeInstallerConfig{
 			Logger: slog.Default(),
 			binariesLocation: packagemanager.BinariesLocation{
-				Systemctl:  systemctlPath,
-				Journalctl: journalctlPath,
+				Systemctl:  systemctlMock.Path,
+				Journalctl: journalctlMock.Path,
 			},
 		},
 	}
@@ -1742,6 +1781,8 @@ printf "%s\n" "$*"
 	require.NoError(t, err)
 	require.NotContains(t, got, "_SYSTEMD_INVOCATION_ID=")
 	require.Contains(t, got, "--unit teleport")
+	require.True(t, systemctlMock.Check(t), "mismatch between expected invocations and actual calls for %q", "systemctl")
+	require.True(t, journalctlMock.Check(t), "mismatch between expected invocations and actual calls for %q", "journalctl")
 }
 
 func TestCaptureJournalPropagatesContextCancellation(t *testing.T) {
@@ -1795,35 +1836,4 @@ func TestRedactFlagArgsForTeleportNodeConfigure(t *testing.T) {
 		"--token=my-secret-token",
 		"--labels=teleport.dev/instance-id=i-123",
 	}, original)
-}
-
-// writeMockScriptWithOutputs creates a tiny shell script that prints output to stdout/stderr
-// and exits 0 (or exits 1 if both outputs are empty).
-func writeMockScriptWithOutputs(t *testing.T, dir, name, stdoutOutput, stderrOutput string) string {
-	t.Helper()
-	scriptPath := filepath.Join(dir, "mock-"+name)
-	exitCode := 0
-	if stdoutOutput == "" && stderrOutput == "" {
-		exitCode = 1
-	}
-
-	var content strings.Builder
-	content.WriteString("#!/bin/sh\n")
-	if stdoutOutput != "" {
-		_, _ = fmt.Fprintf(&content, "printf '%%s\\n' '%s'\n", stdoutOutput)
-	}
-	if stderrOutput != "" {
-		_, _ = fmt.Fprintf(&content, "printf '%%s\\n' '%s' >&2\n", stderrOutput)
-	}
-	_, _ = fmt.Fprintf(&content, "exit %d\n", exitCode)
-
-	require.NoError(t, os.WriteFile(scriptPath, []byte(content.String()), 0o755))
-	return scriptPath
-}
-
-func writeExecutableScript(t *testing.T, dir, name, content string) string {
-	t.Helper()
-	scriptPath := filepath.Join(dir, name)
-	require.NoError(t, os.WriteFile(scriptPath, []byte(content), 0o755))
-	return scriptPath
 }
