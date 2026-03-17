@@ -1298,7 +1298,7 @@ func TestCheckJoinHealth(t *testing.T) {
 			systemctlOutput: "failed",
 			journalOutput:   "error: bad token or something",
 			wantErr:         true,
-			wantErrContains: "state: \"failed\"",
+			wantErrContains: "systemd reported service teleport is not active (state: \"failed\"",
 		},
 		{
 			name:            "socket unavailable and service inactive returns join failure",
@@ -1306,7 +1306,15 @@ func TestCheckJoinHealth(t *testing.T) {
 			systemctlOutput: "inactive",
 			journalOutput:   "permission denied opening BPF",
 			wantErr:         true,
-			wantErrContains: "state: \"inactive\"",
+			wantErrContains: "systemd reported service teleport is not active (state: \"inactive\"",
+		},
+		{
+			name:            "socket unavailable and service deactivating returns transition failure",
+			serveReadyz:     false,
+			systemctlOutput: "deactivating",
+			journalOutput:   "systemd is stopping teleport",
+			wantErr:         true,
+			wantErrContains: "service teleport remained in transition after 0s wait (attempts=2, state=\"deactivating\")",
 		},
 		{
 			name:            "agent ready returns nil",
@@ -1322,7 +1330,7 @@ func TestCheckJoinHealth(t *testing.T) {
 			body:            `{"status":"teleport is starting and hasn't joined the cluster yet","pid":1}`,
 			systemctlOutput: "active",
 			wantErr:         true,
-			wantErrContains: "still starting after",
+			wantErrContains: `readyz remained in starting state after 0s wait (attempts=2, status="teleport is starting and hasn't joined the cluster yet")`,
 		},
 		{
 			name:            "agent not ready returns join failure with journal",
@@ -1332,7 +1340,7 @@ func TestCheckJoinHealth(t *testing.T) {
 			systemctlOutput: "active",
 			journalOutput:   "auth handshake failed: bad token",
 			wantErr:         true,
-			wantErrContains: "Teleport agent failed to join the cluster: bad token",
+			wantErrContains: "readyz reported not ready: bad token",
 		},
 	}
 
@@ -1354,7 +1362,7 @@ func TestCheckJoinHealth(t *testing.T) {
 			inst.binariesLocation.Systemctl = mockSystemctl
 			inst.binariesLocation.Journalctl = mockJournalctl
 
-			checkErr := inst.checkJoinHealth(context.Background(), true /*freshStart*/)
+			checkErr := inst.checkJoinHealth(context.Background())
 			if tt.wantErr {
 				require.Error(t, checkErr)
 				require.Contains(t, checkErr.Error(), "join failure")
@@ -1395,7 +1403,7 @@ func TestInstallAndConfigureLockContention(t *testing.T) {
 	require.Contains(t, err.Error(), "Could not get lock")
 }
 
-func TestCheckJoinHealthStartingWithoutFreshStartFailsFast(t *testing.T) {
+func TestCheckJoinHealthStartingRetriesThenFails(t *testing.T) {
 	t.Parallel()
 
 	tmpDir, dataDirPath := newCheckJoinHealthTempDir(t)
@@ -1406,19 +1414,73 @@ func TestCheckJoinHealthStartingWithoutFreshStartFailsFast(t *testing.T) {
 	mockJournalctl := writeMockScript(t, tmpDir, "journalctl", "join failed")
 
 	inst := newTestJoinHealthInstaller(tmpDir)
-	inst.joinCheckDelay = time.Hour
+	inst.joinCheckDelay = 10 * time.Millisecond
 	inst.binariesLocation.Systemctl = mockSystemctl
 	inst.binariesLocation.Journalctl = mockJournalctl
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	err := inst.checkJoinHealth(ctx, false /*freshStart*/)
+	err := inst.checkJoinHealth(ctx)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "join failure")
 	require.NotErrorIs(t, err, context.DeadlineExceeded)
-	require.Contains(t, err.Error(), "Teleport agent still starting")
-	require.NotContains(t, err.Error(), "after 1h0m0s wait")
+	require.Contains(t, err.Error(), `readyz remained in starting state after 10ms wait (attempts=2, status="teleport is starting and hasn't joined the cluster yet")`)
+}
+
+func TestCheckJoinHealthStartingIncludesTokenHintFromJournal(t *testing.T) {
+	t.Parallel()
+
+	tmpDir, dataDirPath := newCheckJoinHealthTempDir(t)
+	socketPath := filepath.Join(dataDirPath, "debug.sock")
+	startReadyzServer(t, socketPath, http.StatusBadRequest, `{"status":"teleport is starting and hasn't joined the cluster yet","pid":1}`)
+
+	mockSystemctl := writeMockScript(t, tmpDir, "systemctl", "active")
+	mockJournalctl := writeMockScript(t, tmpDir, "journalctl", "Can not join the cluster, the token is expired or not found. Regenerate the token and try again.")
+
+	inst := newTestJoinHealthInstaller(tmpDir)
+	inst.joinCheckDelay = 10 * time.Millisecond
+	inst.binariesLocation.Systemctl = mockSystemctl
+	inst.binariesLocation.Journalctl = mockJournalctl
+
+	err := inst.checkJoinHealth(context.Background())
+	require.Error(t, err)
+	require.Contains(t, err.Error(), `join failure: token is expired or not found; readyz remained in starting state after 10ms wait (attempts=2, status="teleport is starting and hasn't joined the cluster yet")`)
+}
+
+func TestCheckJoinHealthServiceFailureIncludesTokenHintFromJournal(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	mockSystemctl := writeMockScript(t, tmpDir, "systemctl", "failed")
+	mockJournalctl := writeMockScript(t, tmpDir, "journalctl", "Can not join the cluster, the token is expired or not found. Regenerate the token and try again.")
+
+	inst := newTestJoinHealthInstaller(tmpDir)
+	inst.binariesLocation.Systemctl = mockSystemctl
+	inst.binariesLocation.Journalctl = mockJournalctl
+
+	err := inst.checkJoinHealth(context.Background())
+	require.Error(t, err)
+	require.Contains(t, err.Error(), `join failure: token is expired or not found; systemd reported service teleport is not active (state: "failed"`)
+}
+
+func TestCheckJoinHealthReadyzFailureIncludesTokenHintFromJournal(t *testing.T) {
+	t.Parallel()
+
+	tmpDir, dataDirPath := newCheckJoinHealthTempDir(t)
+	socketPath := filepath.Join(dataDirPath, "debug.sock")
+	startReadyzServer(t, socketPath, http.StatusBadRequest, `{"status":"bad token","pid":1}`)
+
+	mockSystemctl := writeMockScript(t, tmpDir, "systemctl", "active")
+	mockJournalctl := writeMockScript(t, tmpDir, "journalctl", "Can not join the cluster, the token is expired or not found. Regenerate the token and try again.")
+
+	inst := newTestJoinHealthInstaller(tmpDir)
+	inst.binariesLocation.Systemctl = mockSystemctl
+	inst.binariesLocation.Journalctl = mockJournalctl
+
+	err := inst.checkJoinHealth(context.Background())
+	require.Error(t, err)
+	require.Contains(t, err.Error(), `join failure: token is expired or not found; readyz reported not ready: bad token`)
 }
 
 func TestCheckReadyzReturnsContextCancellation(t *testing.T) {
@@ -1433,10 +1495,11 @@ func TestCheckReadyzReturnsContextCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	reachable, starting, err := inst.checkReadyz(ctx)
+	reachable, starting, status, err := inst.checkReadyz(ctx)
 	require.NoError(t, err)
 	require.False(t, reachable)
 	require.False(t, starting)
+	require.Empty(t, status)
 }
 
 func TestCheckJoinHealthRetriesSocketUnavailableThenReady(t *testing.T) {
@@ -1458,7 +1521,7 @@ func TestCheckJoinHealthRetriesSocketUnavailableThenReady(t *testing.T) {
 		return debug.Readiness{Ready: true, Status: "ok"}, nil
 	}
 
-	err := inst.checkJoinHealth(context.Background(), false /*freshStart*/)
+	err := inst.checkJoinHealth(context.Background())
 	require.NoError(t, err)
 	require.Equal(t, 2, checkCalls)
 }
@@ -1467,17 +1530,19 @@ func TestCheckReadyzTimeoutReturnsJoinFailure(t *testing.T) {
 	t.Parallel()
 
 	inst := newTestJoinHealthInstaller(t.TempDir())
+	inst.readyzCheckTimeout = 10 * time.Millisecond
 	inst.readyzCheck = func(ctx context.Context) (debug.Readiness, error) {
 		<-ctx.Done()
 		return debug.Readiness{}, ctx.Err()
 	}
 
-	reachable, starting, err := inst.checkReadyz(context.Background())
+	reachable, starting, status, err := inst.checkReadyz(context.Background())
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "join failure")
 	require.Contains(t, err.Error(), "readyz check failed: context deadline exceeded")
 	require.True(t, reachable)
 	require.False(t, starting)
+	require.Empty(t, status)
 }
 
 // newCheckJoinHealthTempDir creates a short-named temporary directory (to stay within macOS's 104-char
@@ -1600,6 +1665,67 @@ func TestAppendJournal(t *testing.T) {
 	}
 }
 
+func TestCaptureJournalFiltersByInvocationID(t *testing.T) {
+	t.Parallel()
+
+	mockDir := t.TempDir()
+	invocationID := "0123456789abcdef0123456789abcdef"
+	systemctlPath := writeExecutableScript(t, mockDir, "mock-systemctl", fmt.Sprintf(`#!/bin/sh
+if [ "$1" = "show" ]; then
+  printf "%%s\n" "%s"
+  exit 0
+fi
+exit 1
+`, invocationID))
+	journalctlPath := writeExecutableScript(t, mockDir, "mock-journalctl", `#!/bin/sh
+printf "%s\n" "$*"
+`)
+
+	installer := &AutoDiscoverNodeInstaller{
+		AutoDiscoverNodeInstallerConfig: &AutoDiscoverNodeInstallerConfig{
+			Logger: slog.Default(),
+			binariesLocation: packagemanager.BinariesLocation{
+				Systemctl:  systemctlPath,
+				Journalctl: journalctlPath,
+			},
+		},
+	}
+
+	got := installer.captureJournal(context.Background(), "teleport")
+	require.Contains(t, got, "_SYSTEMD_INVOCATION_ID="+invocationID)
+	require.Contains(t, got, "--unit teleport")
+}
+
+func TestCaptureJournalFallsBackWithoutInvocationID(t *testing.T) {
+	t.Parallel()
+
+	mockDir := t.TempDir()
+	systemctlPath := writeExecutableScript(t, mockDir, "mock-systemctl", `#!/bin/sh
+if [ "$1" = "show" ]; then
+  printf "%s\n" "active"
+  exit 0
+fi
+exit 1
+`)
+	journalctlPath := writeExecutableScript(t, mockDir, "mock-journalctl", `#!/bin/sh
+printf "%s\n" "$*"
+`)
+
+	installer := &AutoDiscoverNodeInstaller{
+		AutoDiscoverNodeInstallerConfig: &AutoDiscoverNodeInstallerConfig{
+			Logger: slog.Default(),
+			binariesLocation: packagemanager.BinariesLocation{
+				Systemctl:  systemctlPath,
+				Journalctl: journalctlPath,
+			},
+		},
+	}
+
+	got := installer.captureJournal(context.Background(), "teleport")
+	require.NotContains(t, got, "_SYSTEMD_INVOCATION_ID=")
+	require.Contains(t, got, "--unit teleport")
+}
+
 func TestRedactFlagArgsForTeleportNodeConfigure(t *testing.T) {
 	t.Parallel()
 
@@ -1651,5 +1777,12 @@ func writeMockScriptWithOutputs(t *testing.T, dir, name, stdoutOutput, stderrOut
 	_, _ = fmt.Fprintf(&content, "exit %d\n", exitCode)
 
 	require.NoError(t, os.WriteFile(scriptPath, []byte(content.String()), 0o755))
+	return scriptPath
+}
+
+func writeExecutableScript(t *testing.T, dir, name, content string) string {
+	t.Helper()
+	scriptPath := filepath.Join(dir, name)
+	require.NoError(t, os.WriteFile(scriptPath, []byte(content), 0o755))
 	return scriptPath
 }
