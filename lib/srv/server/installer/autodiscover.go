@@ -420,8 +420,14 @@ func (a *AutoDiscoverNodeInstaller) checkJoinHealth(ctx context.Context) error {
 		return a.appendJournalWithJoinFailureHint(ctx, serviceName, err)
 	}
 
-	// Socket is still unavailable after retry and service checks are inconclusive.
-	// Treat this outcome as non-fatal.
+	if !result.definitive {
+		// Service is active but readyz remained unreachable across both attempts.
+		// Treat this as a join failure instead of silently succeeding forever.
+		msg := fmt.Sprintf("readyz socket remained unavailable after %s wait (attempts=%d)", a.joinCheckDelay, joinHealthCheckAttempts)
+		err := trace.Wrap(ErrJoinFailure, msg)
+		return a.appendJournalWithJoinFailureHint(ctx, serviceName, err)
+	}
+
 	return nil
 }
 
@@ -433,8 +439,8 @@ type healthCheckResult struct {
 	// meaning a retry after a delay may produce a different result.
 	definitive bool
 	// starting is true when the non-definitive result came from a "starting" readyz status.
-	// Distinguished from socket-absent so the caller can treat "still starting after wait"
-	// as a failure while treating socket-absent as benign (older Teleport without debug socket).
+	// Distinguished from socket-absent so the caller can emit a more specific message when
+	// "starting" persists after retry.
 	starting bool
 	// startingStatus stores the readyz status string when starting is true.
 	startingStatus string
@@ -492,11 +498,11 @@ type serviceStatusResult struct {
 	err        error
 }
 
-// checkServiceStatus performs a best-effort systemd status check for the named unit.
+// checkServiceStatus performs a systemd status check for the named unit.
 //
 // It returns:
 // - transition=true for transient states like activating/deactivating/reloading;
-// - err!=nil only for recognized terminal non-active states;
+// - err!=nil for recognized terminal non-active states and command execution failures;
 // - zero-value for active/inconclusive cases.
 func (a *AutoDiscoverNodeInstaller) checkServiceStatus(ctx context.Context, serviceName string) serviceStatusResult {
 	cmd := exec.CommandContext(ctx, a.binariesLocation.Systemctl, "is-active", serviceName)
@@ -506,16 +512,24 @@ func (a *AutoDiscoverNodeInstaller) checkServiceStatus(ctx context.Context, serv
 
 	err := cmd.Run()
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return serviceStatusResult{err: trace.Wrap(ctxErr)}
+		}
+
 		// A non-ExitError means the command itself failed to run (binary not
 		// found, permission denied, etc.) rather than reporting a non-active state.
 		var exitErr *exec.ExitError
 		if !errors.As(err, &exitErr) {
-			a.Logger.WarnContext(ctx, "Unable to check service status",
-				"service", serviceName,
-				"error", err,
-				"stderr", strings.TrimSpace(stderr.String()),
-			)
-			return serviceStatusResult{}
+			stderrStr := strings.TrimSpace(stderr.String())
+			return serviceStatusResult{
+				err: trace.Wrap(
+					ErrJoinFailure,
+					"unable to check service %s status via systemctl: %v (stderr: %s)",
+					serviceName,
+					err,
+					stderrStr,
+				),
+			}
 		}
 	}
 
@@ -631,14 +645,20 @@ func isConnectionError(err error) bool {
 // appendJournal enriches err with recent service log lines for the given systemd unit.
 // If no output is available, the original error is returned unchanged.
 func (a *AutoDiscoverNodeInstaller) appendJournal(ctx context.Context, serviceName string, err error) error {
-	journalOutput := a.captureJournal(ctx, serviceName)
+	journalOutput, captureErr := a.captureJournal(ctx, serviceName)
+	if captureErr != nil {
+		return trace.Wrap(captureErr)
+	}
 	return appendJournalOutput(err, journalOutput)
 }
 
 // appendJournalWithJoinFailureHint augments join-failure errors with a concise user-facing hint when journal output
 // contains known token-expiry signals, then appends the captured journal output for diagnostics.
 func (a *AutoDiscoverNodeInstaller) appendJournalWithJoinFailureHint(ctx context.Context, serviceName string, err error) error {
-	journalOutput := a.captureJournal(ctx, serviceName)
+	journalOutput, captureErr := a.captureJournal(ctx, serviceName)
+	if captureErr != nil {
+		return trace.Wrap(captureErr)
+	}
 	err = appendJoinFailureHint(err, journalOutput)
 	return appendJournalOutput(err, journalOutput)
 }
@@ -673,8 +693,12 @@ func appendJoinFailureHint(err error, journalOutput string) error {
 	if strings.Contains(strings.ToLower(userMessage), hint) {
 		return err
 	}
+	baseMessage := strings.TrimSpace(strings.TrimPrefix(userMessage, ErrJoinFailure.Error()+": "))
+	if baseMessage == "" {
+		baseMessage = strings.TrimSpace(userMessage)
+	}
 
-	return trace.Wrap(ErrJoinFailure, "join failure: %s; %s", hint, userMessage)
+	return trace.Wrap(err, "%s: %s; %s", ErrJoinFailure.Error(), hint, baseMessage)
 }
 
 func isSystemdInvocationID(value string) bool {
@@ -701,33 +725,56 @@ func buildJournalctlArgs(serviceName, invocationID string) []string {
 	return args
 }
 
-func (a *AutoDiscoverNodeInstaller) getServiceInvocationID(ctx context.Context, serviceName string) string {
+func (a *AutoDiscoverNodeInstaller) getServiceInvocationID(ctx context.Context, serviceName string) (string, error) {
 	cmd := exec.CommandContext(ctx, a.binariesLocation.Systemctl, "show", serviceName, "--property", "InvocationID", "--value")
-	output, err := cmd.CombinedOutput()
+	var stdoutBuf, stderrBuf bytes.Buffer
+	cmd.Stdout = &stdoutBuf
+	cmd.Stderr = &stderrBuf
+	err := cmd.Run()
+	stdout := strings.TrimSpace(stdoutBuf.String())
+	stderr := strings.TrimSpace(stderrBuf.String())
 	if err != nil {
-		a.Logger.DebugContext(ctx, "Could not retrieve service invocation ID", "service", serviceName, "error", err, "output", strings.TrimSpace(string(output)))
-		return ""
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", trace.Wrap(ctxErr)
+		}
+
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			a.Logger.DebugContext(ctx, "systemctl show exited non-zero while retrieving service invocation ID",
+				"service", serviceName,
+				"exit_code", exitErr.ExitCode(),
+				"stdout", stdout,
+				"stderr", stderr,
+			)
+			return "", nil
+		}
+
+		a.Logger.DebugContext(ctx, "Could not retrieve service invocation ID", "service", serviceName, "error", err, "stdout", stdout, "stderr", stderr)
+		return "", nil
 	}
 
-	invocationID := strings.TrimSpace(string(output))
+	invocationID := stdout
 	if invocationID == "" || strings.EqualFold(invocationID, "n/a") {
-		return ""
+		return "", nil
 	}
 
 	if !isSystemdInvocationID(invocationID) {
 		a.Logger.DebugContext(ctx, "Ignoring invalid service invocation ID", "service", serviceName, "invocation_id", invocationID)
-		return ""
+		return "", nil
 	}
 
-	return invocationID
+	return invocationID, nil
 }
 
 // captureJournal is a best-effort helper that runs journalctl to retrieve recent log
 // lines for the given systemd unit.
 // Stderr is logged internally but not returned, to keep caller-facing diagnostics
 // focused on journal contents.
-func (a *AutoDiscoverNodeInstaller) captureJournal(ctx context.Context, serviceName string) string {
-	invocationID := a.getServiceInvocationID(ctx, serviceName)
+func (a *AutoDiscoverNodeInstaller) captureJournal(ctx context.Context, serviceName string) (string, error) {
+	invocationID, err := a.getServiceInvocationID(ctx, serviceName)
+	if err != nil {
+		return "", trace.Wrap(err)
+	}
 	args := buildJournalctlArgs(serviceName, invocationID)
 
 	cmd := exec.CommandContext(ctx, a.binariesLocation.Journalctl, args...)
@@ -735,9 +782,13 @@ func (a *AutoDiscoverNodeInstaller) captureJournal(ctx context.Context, serviceN
 	cmd.Stdout = &stdoutBuf
 	cmd.Stderr = &stderrBuf
 
-	err := cmd.Run()
+	err = cmd.Run()
 	stderrOutput := strings.TrimSpace(stderrBuf.String())
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", trace.Wrap(ctxErr)
+		}
+
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
 			a.Logger.DebugContext(ctx, "journalctl exited non-zero", "service", serviceName, "exit_code", exitErr.ExitCode(), "stderr", stderrOutput)
@@ -746,7 +797,7 @@ func (a *AutoDiscoverNodeInstaller) captureJournal(ctx context.Context, serviceN
 		}
 	}
 
-	return strings.TrimSpace(stdoutBuf.String())
+	return strings.TrimSpace(stdoutBuf.String()), nil
 }
 
 // enableAndRestartTeleportService will enable and (re)start the teleport.service.

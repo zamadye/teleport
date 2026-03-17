@@ -1268,7 +1268,7 @@ CPE_NAME="cpe:/o:suse:sles:12:sp3"`
 
 // TestCheckJoinHealth verifies the code paths in checkJoinHealth:
 // readyz success, readyz failure (with journal capture), and socket-unavailable fallback
-// to systemctl is-active (both active and not-active states).
+// to systemctl is-active (including active with persistent socket unavailability).
 func TestCheckJoinHealth(t *testing.T) {
 	t.Parallel()
 
@@ -1288,9 +1288,11 @@ func TestCheckJoinHealth(t *testing.T) {
 		wantErrContains     string
 	}{
 		{
-			name:            "socket unavailable and service active skips check",
+			name:            "socket unavailable and service active returns join failure",
 			serveReadyz:     false,
 			systemctlOutput: "active",
+			wantErr:         true,
+			wantErrContains: "readyz socket remained unavailable after 0s wait (attempts=2)",
 		},
 		{
 			name:            "socket unavailable and service failed returns join failure",
@@ -1418,7 +1420,7 @@ func TestCheckJoinHealthStartingRetriesThenFails(t *testing.T) {
 	inst.binariesLocation.Systemctl = mockSystemctl
 	inst.binariesLocation.Journalctl = mockJournalctl
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	err := inst.checkJoinHealth(ctx)
@@ -1462,6 +1464,22 @@ func TestCheckJoinHealthServiceFailureIncludesTokenHintFromJournal(t *testing.T)
 	err := inst.checkJoinHealth(context.Background())
 	require.Error(t, err)
 	require.Contains(t, err.Error(), `join failure: token is expired or not found; systemd reported service teleport is not active (state: "failed"`)
+}
+
+func TestCheckJoinHealthSystemctlExecutionFailureReturnsJoinFailure(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	mockJournalctl := writeMockScript(t, tmpDir, "journalctl", "journal output")
+
+	inst := newTestJoinHealthInstaller(tmpDir)
+	inst.binariesLocation.Systemctl = filepath.Join(tmpDir, "missing-systemctl")
+	inst.binariesLocation.Journalctl = mockJournalctl
+
+	err := inst.checkJoinHealth(context.Background())
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "join failure")
+	require.Contains(t, err.Error(), "unable to check service teleport status via systemctl")
 }
 
 func TestCheckJoinHealthReadyzFailureIncludesTokenHintFromJournal(t *testing.T) {
@@ -1671,11 +1689,9 @@ func TestCaptureJournalFiltersByInvocationID(t *testing.T) {
 	mockDir := t.TempDir()
 	invocationID := "0123456789abcdef0123456789abcdef"
 	systemctlPath := writeExecutableScript(t, mockDir, "mock-systemctl", fmt.Sprintf(`#!/bin/sh
-if [ "$1" = "show" ]; then
-  printf "%%s\n" "%s"
-  exit 0
-fi
-exit 1
+printf "%%s\n" "systemctl warning" >&2
+printf "%%s\n" "%s"
+exit 0
 `, invocationID))
 	journalctlPath := writeExecutableScript(t, mockDir, "mock-journalctl", `#!/bin/sh
 printf "%s\n" "$*"
@@ -1691,7 +1707,8 @@ printf "%s\n" "$*"
 		},
 	}
 
-	got := installer.captureJournal(context.Background(), "teleport")
+	got, err := installer.captureJournal(context.Background(), "teleport")
+	require.NoError(t, err)
 	require.Contains(t, got, "_SYSTEMD_INVOCATION_ID="+invocationID)
 	require.Contains(t, got, "--unit teleport")
 }
@@ -1721,9 +1738,33 @@ printf "%s\n" "$*"
 		},
 	}
 
-	got := installer.captureJournal(context.Background(), "teleport")
+	got, err := installer.captureJournal(context.Background(), "teleport")
+	require.NoError(t, err)
 	require.NotContains(t, got, "_SYSTEMD_INVOCATION_ID=")
 	require.Contains(t, got, "--unit teleport")
+}
+
+func TestCaptureJournalPropagatesContextCancellation(t *testing.T) {
+	t.Parallel()
+
+	mockDir := t.TempDir()
+	installer := &AutoDiscoverNodeInstaller{
+		AutoDiscoverNodeInstallerConfig: &AutoDiscoverNodeInstallerConfig{
+			Logger: slog.Default(),
+			binariesLocation: packagemanager.BinariesLocation{
+				Systemctl:  filepath.Join(mockDir, "missing-systemctl"),
+				Journalctl: filepath.Join(mockDir, "missing-journalctl"),
+			},
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	got, err := installer.captureJournal(ctx, "teleport")
+	require.Empty(t, got)
+	require.Error(t, err)
+	require.ErrorIs(t, err, context.Canceled)
 }
 
 func TestRedactFlagArgsForTeleportNodeConfigure(t *testing.T) {
