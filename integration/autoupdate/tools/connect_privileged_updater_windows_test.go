@@ -409,6 +409,8 @@ func getDefaultConfig(t *testing.T) *privilegedupdater.ServiceTestConfig {
 		UpdateBaseDir:               t.TempDir(),
 		// Allow Authenticated Users to create the pipe in tests.
 		PipeAuthenticatedUsersAccess: windows.GENERIC_READ | windows.GENERIC_WRITE,
+		// Integration test updates are unsigned.
+		VerifySignature: func(string) error { return nil },
 	}
 }
 
