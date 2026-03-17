@@ -338,6 +338,11 @@ auth_service:
 
 ## Step 3/5. (Re)start Teleport Auth
 
+Before proceeding, ensure that the signature_algorithm_suite of the
+cluster_auth_preference is set to `hsm-v1`, see
+[Signature Algorithm Suites](../../../reference/deployment/signature-algorithms.mdx)
+for more details.
+
 If this is a new Teleport Auth Service which has not been started yet, starting
 a brand new cluster with an empty backend, HSM keys will be automatically
 generated at startup and no further action is required, skip to step 5.
